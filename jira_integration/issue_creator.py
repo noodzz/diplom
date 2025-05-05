@@ -41,12 +41,15 @@ def create_jira_issues(calendar_plan):
         # Определяем приоритет задачи (критические задачи имеют высокий приоритет)
         priority = "High" if task['is_critical'] else "Medium"
 
+        # Используем email сотрудника если он доступен, иначе используем имя
+        assignee = task.get('employee_email') if task.get('employee_email') else task['employee']
+
         # Создаем задачу в Jira
         issue = client.create_issue(
             project_key=JIRA_PROJECT_KEY,
             summary=summary,
             description=description,
-            assignee=task['employee'],
+            assignee=assignee,
             due_date=task['end_date'],
             priority=priority
         )
@@ -57,7 +60,7 @@ def create_jira_issues(calendar_plan):
             created_issues.append({
                 'key': issue.key,
                 'summary': summary,
-                'assignee': task['employee']
+                'assignee': assignee
             })
 
     # Устанавливаем зависимости между задачами

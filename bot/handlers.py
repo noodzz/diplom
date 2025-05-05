@@ -1,10 +1,10 @@
-from telegram import Update, InputFile
+from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
 from bot.states import BotStates
 from bot.keyboards import (
     main_menu_keyboard, project_type_keyboard, templates_keyboard,
     task_actions_keyboard, dependencies_actions_keyboard,
-    employees_actions_keyboard, plan_actions_keyboard
+    employees_actions_keyboard, plan_actions_keyboard, projects_keyboard
 )
 from bot.messages import (
     WELCOME_MESSAGE, HELP_MESSAGE, SELECT_PROJECT_TYPE_MESSAGE,
@@ -15,13 +15,15 @@ from bot.messages import (
 from database.operations import (
     create_new_project, add_project_task, add_task_dependencies,
     add_project_employee, get_project_data, get_employees_by_position,
-    get_project_templates, create_project_from_template
+    get_project_templates, create_project_from_template, get_user_projects
 )
 from utils.csv_import import create_project_from_csv, parse_csv_tasks
 from planning.network import calculate_network_parameters
 from planning.calendar import create_calendar_plan
 from planning.visualization import generate_gantt_chart
 from jira_integration.issue_creator import create_jira_issues
+from bot.telegram_helpers import safe_edit_message_text
+import telegram
 import io
 import csv
 
@@ -85,7 +87,8 @@ async def use_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
     templates = get_project_templates()
 
     if not templates:
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             "Шаблоны проектов не найдены. Пожалуйста, создайте новый проект или добавьте шаблоны.",
             reply_markup=project_type_keyboard()
         )
@@ -99,7 +102,8 @@ async def use_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message += f" - {template['description']}"
         message += "\n"
 
-    await query.edit_message_text(
+    await safe_edit_message_text(
+        query,
         message,
         reply_markup=templates_keyboard(templates)
     )
@@ -118,7 +122,8 @@ async def select_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сохраняем ID шаблона в контексте
     context.user_data['template_id'] = template_id
 
-    await query.edit_message_text(CREATE_PROJECT_PROMPT)
+    # Запрашиваем название проекта
+    await safe_edit_message_text(query, CREATE_PROJECT_PROMPT)
 
     return BotStates.CREATE_PROJECT
 
@@ -129,7 +134,7 @@ async def upload_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query:
         await query.answer()
-        await query.edit_message_text(UPLOAD_CSV_PROMPT)
+        await safe_edit_message_text(query,UPLOAD_CSV_PROMPT)
 
     return BotStates.UPLOAD_CSV
 
@@ -219,6 +224,47 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем задачи в контексте
         context.user_data['tasks'] = project_data['tasks']
 
+        # Получаем базовый проект с сотрудниками
+        base_project = get_project_data(1)  # Предполагается, что базовый проект имеет ID=1
+
+        # Если есть базовый проект и в нем есть сотрудники
+        if base_project and base_project['employees']:
+            # Копируем сотрудников из базового проекта в новый проект
+            for employee in base_project['employees']:
+                add_project_employee(
+                    project_id=project_id,
+                    name=employee['name'],
+                    position=employee['position'],
+                    days_off=employee['days_off']
+                )
+
+            # Обновляем данные проекта после добавления сотрудников
+            project_data = get_project_data(project_id)
+
+            # Сохраняем сотрудников в контексте
+            context.user_data['employees'] = project_data['employees']
+
+            # Переходим сразу к расчету плана, так как у нас есть все необходимые данные
+            await update.message.reply_text(
+                f"Проект '{project_name}' создан на основе шаблона. Сотрудники автоматически добавлены из базового проекта. Теперь вы можете рассчитать календарный план."
+            )
+
+            # Создаем клавиатуру с действиями для проекта
+            keyboard = [
+                [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+                [InlineKeyboardButton("Редактировать задачи", callback_data="edit_tasks")],
+                [InlineKeyboardButton("Редактировать сотрудников", callback_data="edit_employees")],
+                [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
+            ]
+
+            await update.message.reply_text(
+                f"Выберите дальнейшие действия:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+            return BotStates.ADD_TASK
+
+        # Если нет базового проекта или в нем нет сотрудников, запрашиваем добавление сотрудников
         await update.message.reply_text(
             f"Проект '{project_name}' создан на основе шаблона. Теперь добавьте информацию о сотрудниках.\n\n{ADD_EMPLOYEES_PROMPT}"
         )
@@ -332,7 +378,8 @@ async def add_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query and query.data == 'next':
         await query.answer()
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             f"Укажите зависимости между задачами.\n\n{ADD_DEPENDENCIES_PROMPT}"
         )
         # Отправляем список задач для удобства
@@ -420,7 +467,8 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             employees_text += "\nВы можете добавить новых сотрудников или перейти к расчету календарного плана.\n\n"
 
-        await query.edit_message_text(
+        await safe_edit_message_text(
+            query,
             f"{employees_text}Добавьте информацию о сотрудниках.\n\n{ADD_EMPLOYEES_PROMPT}",
             reply_markup=employees_actions_keyboard()
         )
@@ -465,7 +513,7 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(PLAN_CALCULATION_START)
+    await safe_edit_message_text(query, PLAN_CALCULATION_START)
 
     # Получаем данные проекта из БД
     project_id = context.user_data['current_project_id']
@@ -491,7 +539,17 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gantt_buffer.seek(0)
 
     # Формируем текстовый отчет
-    critical_path_text = "Критический путь: " + " -> ".join([task['name'] for task in calendar_plan['critical_path']])
+    # Исправление: проверяем тип critical_path и обрабатываем соответственно
+    if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
+        # Если critical_path содержит словари, извлекаем имена задач
+        critical_path_text = "Критический путь: " + " -> ".join([task['name'] for task in calendar_plan['critical_path']])
+    elif calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], str):
+        # Если critical_path уже содержит строки (имена задач)
+        critical_path_text = "Критический путь: " + " -> ".join(calendar_plan['critical_path'])
+    else:
+        # Если critical_path пуст или имеет неожиданный формат
+        critical_path_text = "Критический путь не определен"
+
     project_duration = calendar_plan['project_duration']
 
     report = f"""
@@ -528,7 +586,7 @@ async def export_to_jira(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text("Экспортирую задачи в Jira...")
+    await safe_edit_message_text(query, "Экспортирую задачи в Jira...")
 
     # Получаем данные календарного плана
     calendar_plan = context.user_data['calendar_plan']
@@ -551,16 +609,46 @@ async def export_to_jira(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик просмотра списка проектов."""
-    # TODO: Реализовать вывод списка проектов из БД
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
-        "Функция просмотра списка проектов находится в разработке.",
-        reply_markup=main_menu_keyboard()
+    # Получаем ID пользователя
+    user_id = update.effective_user.id
+
+    # Получаем список проектов из БД
+    projects = get_user_projects(user_id)
+
+    if not projects:
+        await safe_edit_message_text(
+            query,
+            "У вас пока нет проектов. Вы можете создать новый проект.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Создать проект", callback_data="create_project"),
+                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+            ]])
+        )
+        return BotStates.MAIN_MENU
+
+    # Формируем сообщение со списком проектов
+    message = "📋 *Ваши проекты:*\n\n"
+
+    # Отображаем проекты с датой создания
+    for i, project in enumerate(projects):
+        message += f"{i + 1}. *{project['name']}*\n"
+        message += f"   Дата создания: {project['created_at']}\n"
+        message += f"   Задач: {project['tasks_count']}\n\n"
+
+    message += "Выберите проект для просмотра деталей или создайте новый."
+
+    # Отправляем сообщение с клавиатурой выбора проекта
+    await safe_edit_message_text(
+        query,
+        message,
+        reply_markup=projects_keyboard(projects),
+        parse_mode='Markdown'
     )
 
-    return BotStates.MAIN_MENU
+    return BotStates.SELECT_PROJECT
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -590,9 +678,79 @@ async def back_to_project_type(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
+    await safe_edit_message_text(
+        query,
         SELECT_PROJECT_TYPE_MESSAGE,
         reply_markup=project_type_keyboard()
     )
 
     return BotStates.SELECT_PROJECT_TYPE
+
+
+async def select_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора проекта из списка."""
+    query = update.callback_query
+    await query.answer()
+
+    # Получаем ID выбранного проекта
+    project_id = int(query.data.split('_')[1])
+
+    # Получаем данные проекта
+    project_data = get_project_data(project_id)
+
+    if not project_data:
+        await safe_edit_message_text(
+            query,
+            "Проект не найден или был удален.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Сохраняем ID проекта в контексте
+    context.user_data['current_project_id'] = project_id
+
+    # Сохраняем задачи и сотрудников проекта в контексте
+    context.user_data['tasks'] = project_data['tasks']
+    context.user_data['employees'] = project_data['employees']
+
+    # Формируем сообщение с информацией о проекте
+    message = f"📊 *Проект: {project_data['name']}*\n\n"
+
+    # Информация о задачах
+    message += f"*Задачи:* {len(project_data['tasks'])}\n\n"
+
+    if project_data['tasks']:
+        message += "*Список задач:*\n"
+        for i, task in enumerate(project_data['tasks'][:5]):  # Показываем только первые 5 задач
+            message += f"{i + 1}. {task['name']} ({task['duration']} дн.) - {task['position']}\n"
+
+        if len(project_data['tasks']) > 5:
+            message += f"... и еще {len(project_data['tasks']) - 5} задач\n"
+    else:
+        message += "Задачи еще не добавлены.\n"
+
+    message += "\n*Сотрудники:* "
+    if project_data['employees']:
+        message += f"{len(project_data['employees'])}\n"
+    else:
+        message += "пока не добавлены.\n"
+
+    message += "\nВыберите действие:"
+
+    # Создаем клавиатуру с действиями для проекта
+    keyboard = [
+        [InlineKeyboardButton("Добавить задачи", callback_data="add_tasks")],
+        [InlineKeyboardButton("Добавить сотрудников", callback_data="add_employees")],
+        [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+        [InlineKeyboardButton("Назад к списку проектов", callback_data="list_projects")],
+        [InlineKeyboardButton("Главное меню", callback_data="main_menu")]
+    ]
+
+    await safe_edit_message_text(
+        query,
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+    return BotStates.ADD_TASK  # Используем существующее состояние для работы с задачами

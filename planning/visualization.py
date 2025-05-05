@@ -18,9 +18,8 @@ def generate_gantt_chart(calendar_plan):
     Returns:
         Изображение диаграммы Ганта в формате PIL.Image
     """
-    tasks = calendar_plan['tasks']
-
-    if not tasks:
+    # Проверяем, есть ли задачи в календарном плане
+    if not calendar_plan or 'tasks' not in calendar_plan or not calendar_plan['tasks']:
         # Создаем пустое изображение, если нет задач
         image = Image.new('RGB', (400, 200), 'white')
         draw = ImageDraw.Draw(image)
@@ -31,15 +30,41 @@ def generate_gantt_chart(calendar_plan):
         draw.text((10, 10), "Нет задач для отображения", fill="black", font=font)
         return image
 
+    tasks = calendar_plan['tasks']
+
+    # Проверяем структуру задач
+    for task in tasks:
+        if not isinstance(task, dict) or 'start_date' not in task or 'end_date' not in task:
+            # Создаем пустое изображение, если структура задач некорректна
+            image = Image.new('RGB', (500, 200), 'white')
+            draw = ImageDraw.Draw(image)
+            try:
+                font = ImageFont.truetype('arial.ttf', 12)
+            except IOError:
+                font = ImageFont.load_default()
+            draw.text((10, 10), "Некорректный формат данных задач", fill="black", font=font)
+            return image
+
     # Определяем временные границы проекта
-    start_date = min(task['start_date'] for task in tasks)
-    end_date = max(task['end_date'] for task in tasks)
-    project_duration = (end_date - start_date).days + 1
+    try:
+        start_date = min(task['start_date'] for task in tasks)
+        end_date = max(task['end_date'] for task in tasks)
+        project_duration = (end_date - start_date).days + 1
+    except (TypeError, KeyError, ValueError) as e:
+        # Создаем пустое изображение в случае ошибки при вычислении временных границ
+        image = Image.new('RGB', (500, 200), 'white')
+        draw = ImageDraw.Draw(image)
+        try:
+            font = ImageFont.truetype('arial.ttf', 12)
+        except IOError:
+            font = ImageFont.load_default()
+        draw.text((10, 10), f"Ошибка при определении временных границ: {str(e)}", fill="black", font=font)
+        return image
 
     # Настройки изображения
     task_height = 30
     day_width = 30
-    margin_left = 250  # Для названий задач слева
+    margin_left = 300  # Увеличиваем отступ слева с 250 до 300 для имен задач и исполнителей
     margin_top = 60  # Для шкалы времени и заголовка
     legend_height = 50  # Высота для легенды внизу
 
@@ -75,15 +100,16 @@ def generate_gantt_chart(calendar_plan):
     sorted_tasks = sorted(tasks, key=lambda x: x['start_date'])
 
     for i, task in enumerate(sorted_tasks):
+        # Проверяем обязательные поля задачи
+        if not all(key in task for key in ['name', 'employee', 'is_critical']):
+            continue
+
         draw_task(draw, task, i, start_date, margin_left, margin_top, day_width, task_height, colors, font, small_font)
 
     # Добавляем легенду
     draw_legend(draw, image_width, image_height, legend_height, font)
 
     return image
-
-
-# planning/visualization.py (продолжение)
 
 def draw_time_scale(draw, start_date, duration, margin_left, margin_top, day_width, image_height, font):
     """
@@ -111,9 +137,10 @@ def draw_time_scale(draw, start_date, duration, margin_left, margin_top, day_wid
         # Вертикальная линия
         draw.line([(x, margin_top - 20), (x, image_height)], fill='lightgray')
 
-        # Метка даты
-        date_text = date.strftime('%d.%m')
-        draw.text((x - 15, margin_top - 20), date_text, fill='black', font=font)
+        # Метка даты - отображаем только каждый второй день для экономии места
+        if i % 2 == 0:
+            date_text = date.strftime('%d.%m')
+            draw.text((x - 15, margin_top - 20), date_text, fill='black', font=font)
 
         # Выделяем выходные дни (суббота и воскресенье)
         if date.weekday() >= 5:  # 5 - суббота, 6 - воскресенье
@@ -125,7 +152,7 @@ def draw_time_scale(draw, start_date, duration, margin_left, margin_top, day_wid
 
     # Добавляем метки для заголовков столбцов
     draw.text((10, margin_top - 20), "Задача", fill='black', font=font)
-    draw.text((margin_left - 100, margin_top - 20), "Исполнитель", fill='black', font=font)
+    draw.text((margin_left - 150, margin_top - 20), "Исполнитель", fill='black', font=font)
 
 
 def draw_task(draw, task, index, start_date, margin_left, margin_top, day_width, task_height, colors, font, small_font):
@@ -153,11 +180,10 @@ def draw_task(draw, task, index, start_date, margin_left, margin_top, day_width,
         task_name = task_name[:27] + "..."
     draw.text((10, y + 5), task_name, fill='black', font=font)
 
-    # Рисуем имя исполнителя
-    employee_name = task['employee']
-    if len(employee_name) > 15:
-        employee_name = employee_name[:12] + "..."
-    draw.text((margin_left - 100, y + 5), employee_name, fill='black', font=font)
+    # Рисуем имя исполнителя в формате "Фамилия И.О."
+    full_name = task['employee']
+    short_name = format_employee_name(full_name)
+    draw.text((margin_left - 100, y + 5), short_name, fill='black', font=font)
 
     # Координаты задачи
     days_from_start = (task['start_date'] - start_date).days
@@ -185,6 +211,29 @@ def draw_task(draw, task, index, start_date, margin_left, margin_top, day_width,
     # Проверяем, достаточно ли места для текста
     if right - left > text_width + 10:
         draw.text((left + 5, top + 5), duration_text, fill='black', font=small_font)
+
+
+def format_employee_name(full_name):
+    """
+    Форматирует полное имя сотрудника в формат "Фамилия И.О."
+
+    Args:
+        full_name: Полное имя сотрудника (Фамилия Имя Отчество)
+
+    Returns:
+        Сокращенное имя в формате "Фамилия И.О."
+    """
+    parts = full_name.split()
+
+    if len(parts) >= 3:
+        # Если есть фамилия, имя и отчество
+        return f"{parts[0]} {parts[1][0]}.{parts[2][0]}."
+    elif len(parts) == 2:
+        # Если есть только фамилия и имя
+        return f"{parts[0]} {parts[1][0]}."
+    else:
+        # Если передано только одно слово или пустая строка
+        return full_name
 
 
 def draw_hatching(draw, left, top, right, bottom):
@@ -224,8 +273,8 @@ def draw_legend(draw, image_width, image_height, legend_height, font):
     # Критический путь
     sample_left = 100
     sample_top = legend_top + 20
-    sample_right = sample_left + 40
-    sample_bottom = sample_top + 20
+    sample_right = sample_left + 40  # Убедимся, что sample_right > sample_left
+    sample_bottom = sample_top + 20  # Убедимся, что sample_bottom > sample_top
 
     # Образец критической задачи
     draw.rectangle([sample_left, sample_top, sample_right, sample_bottom], fill='#ffaaaa', outline='black')
@@ -234,11 +283,13 @@ def draw_legend(draw, image_width, image_height, legend_height, font):
 
     # Образец обычной задачи
     sample_left = 300
+    sample_right = sample_left + 40  # Обновляем sample_right после изменения sample_left
     draw.rectangle([sample_left, sample_top, sample_right, sample_bottom], fill='#aaaaff', outline='black')
     draw.text((sample_right + 10, sample_top + 5), "Обычная задача", fill='black', font=font)
 
     # Образец выходного дня
     sample_left = 500
+    sample_right = sample_left + 40  # Обновляем sample_right после изменения sample_left
     draw.rectangle([sample_left, sample_top, sample_right, sample_bottom], fill='#f0f0f0', outline='lightgray')
     draw.text((sample_right + 10, sample_top + 5), "Выходной день", fill='black', font=font)
 

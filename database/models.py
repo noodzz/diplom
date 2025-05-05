@@ -67,6 +67,7 @@ class Employee(Base):
     project_id = Column(Integer, ForeignKey('projects.id'), nullable=False)
     name = Column(String, nullable=False)
     position = Column(String, nullable=False)
+    email = Column(String, nullable=True)
 
     project = relationship("Project", back_populates="employees")
     days_off = relationship("DayOff", back_populates="employee")
@@ -123,3 +124,17 @@ class TaskTemplate(Base):
 
     def __repr__(self):
         return f"<TaskTemplate(id={self.id}, name='{self.name}', duration={self.duration})>"
+
+class TaskTemplateDependency(Base):
+    """Модель зависимости между шаблонами задач в БД."""
+    __tablename__ = 'task_template_dependencies'
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey('task_templates.id'), nullable=False)
+    predecessor_id = Column(Integer, ForeignKey('task_templates.id'), nullable=False)
+
+    task = relationship("TaskTemplate", foreign_keys=[task_id], back_populates="dependencies")
+    predecessor = relationship("TaskTemplate", foreign_keys=[predecessor_id])
+
+    def __repr__(self):
+        return f"<TaskTemplateDependency(task_id={self.task_id}, predecessor_id={self.predecessor_id})>"

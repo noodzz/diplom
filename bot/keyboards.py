@@ -67,3 +67,23 @@ def templates_keyboard(templates):
     keyboard.append([InlineKeyboardButton("Вернуться назад", callback_data="back_to_project_type")])
 
     return InlineKeyboardMarkup(keyboard)
+
+def projects_keyboard(projects):
+    """
+    Клавиатура списка проектов.
+
+    Args:
+        projects: Список проектов
+    """
+    keyboard = []
+
+    for project in projects:
+        keyboard.append([InlineKeyboardButton(
+            f"{project['name']} ({project['tasks_count']} задач)",
+            callback_data=f"project_{project['id']}"
+        )])
+
+    keyboard.append([InlineKeyboardButton("Создать новый проект", callback_data="create_project")])
+    keyboard.append([InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")])
+
+    return InlineKeyboardMarkup(keyboard)

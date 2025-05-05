@@ -1,5 +1,5 @@
 # main.py
-import logging
+from logger import logger  # Import from the new logger module
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -14,19 +14,11 @@ from bot.handlers import (
     select_project_type, use_template, select_template, upload_csv, process_csv,
     create_project, add_task, list_projects, add_dependencies,
     add_employees, calculate_plan, export_to_jira, cancel,
-    back_to_main, back_to_project_type
+    back_to_main, back_to_project_type, select_project
 )
 from bot.states import BotStates
 from config import BOT_TOKEN
 from database.operations import init_db
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-
-logger = logging.getLogger(__name__)
-
 
 def main():
     """Запуск бота."""
@@ -55,7 +47,8 @@ def main():
                 CallbackQueryHandler(back_to_project_type, pattern='^back_to_project_type$'),
             ],
             BotStates.UPLOAD_CSV: [
-                MessageHandler(filters.DOCUMENT, process_csv),
+                # Here's the fix: using filters.Document instead of filters.DOCUMENT
+                MessageHandler(filters.Document.ALL, process_csv),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_csv),
             ],
             BotStates.CREATE_PROJECT: [
@@ -63,7 +56,11 @@ def main():
             ],
             BotStates.ADD_TASK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task),
-                CallbackQueryHandler(add_dependencies, pattern='^next$')
+                CallbackQueryHandler(add_dependencies, pattern='^next$'),
+                CallbackQueryHandler(list_projects, pattern='^list_projects$'),
+                CallbackQueryHandler(calculate_plan, pattern='^calculate$'),
+                CallbackQueryHandler(add_employees, pattern='^edit_employees$'),
+                CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
             ],
             BotStates.ADD_DEPENDENCIES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_dependencies),
@@ -76,6 +73,12 @@ def main():
             BotStates.SHOW_PLAN: [
                 CallbackQueryHandler(export_to_jira, pattern='^export_jira$'),
                 CallbackQueryHandler(start, pattern='^main_menu$')
+            ],
+            # Добавляем новое состояние для выбора проекта
+            BotStates.SELECT_PROJECT: [
+                CallbackQueryHandler(select_project, pattern='^project_'),
+                CallbackQueryHandler(select_project_type, pattern='^create_project$'),
+                CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
             ],
         },
         fallbacks=[CommandHandler('cancel', cancel)]

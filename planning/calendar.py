@@ -90,6 +90,7 @@ def create_calendar_plan(network_parameters, project_data):
             'is_critical': task['is_critical'],
             'reserve': task['reserve'],
             'employee': employee['name'],
+            'employee_email': employee.get('email'),  # Добавляем email сотрудника
             'predecessors': task.get('predecessors', [])
         })
 

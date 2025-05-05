@@ -1,7 +1,8 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from database.models import Base, Project, Task, TaskDependency, Employee, DayOff
+from database.models import Base, Project, Task, TaskDependency, Employee, DayOff, ProjectTemplate, TaskTemplate, TaskTemplateDependency
 from config import DATABASE_URL
+from logger import logger
 
 # Создаем соединение с БД
 engine = create_engine(DATABASE_URL)
@@ -150,6 +151,7 @@ def get_employees_by_position(project_id, position=None):
                 'id': employee.id,
                 'name': employee.name,
                 'position': employee.position,
+                'email': employee.email,  # Добавляем email в результат
                 'days_off': days_off_list
             })
 
@@ -204,6 +206,7 @@ def get_project_data(project_id):
                 'id': employee.id,
                 'name': employee.name,
                 'position': employee.position,
+                'email': employee.email,  # Добавляем email в результат
                 'days_off': days_off_list
             })
 
@@ -405,5 +408,48 @@ def create_project_from_template(template_id, project_name):
 
         session.commit()
         return project.id
+    finally:
+        session.close()
+
+
+def get_user_projects(user_id=None):
+    """
+    Получает список проектов пользователя.
+
+    Args:
+        user_id: ID пользователя в Telegram (необязательно)
+
+    Returns:
+        Список проектов в формате [{'id': id, 'name': name, 'created_at': date, 'tasks_count': count}]
+    """
+    session = Session()
+    try:
+        query = session.query(Project)
+
+        # Если будет добавлена привязка к пользователю, можно раскомментировать
+        # if user_id:
+        #     query = query.filter(Project.user_id == user_id)
+
+        projects = query.order_by(Project.created_at.desc()).all()
+
+        result = []
+        for project in projects:
+            # Получаем количество задач в проекте
+            tasks_count = session.query(Task).filter(Task.project_id == project.id).count()
+
+            # Форматируем дату создания
+            created_at = project.created_at.strftime("%d.%m.%Y %H:%M") if project.created_at else "Н/Д"
+
+            result.append({
+                'id': project.id,
+                'name': project.name,
+                'created_at': created_at,
+                'tasks_count': tasks_count
+            })
+
+        return result
+    except Exception as e:
+        logger.error(f"Error retrieving projects: {str(e)}")
+        return []
     finally:
         session.close()
