@@ -42,22 +42,23 @@ class JiraClient:
             logger.error(f"Jira connection test failed: {str(e)}")
             return False
 
-    def create_issue(self, project_key, summary, description, assignee=None, due_date=None, priority=None,
-                     issue_type='Task'):
+    def create_issue(self, project_key, summary, description, assignee=None, due_date=None,
+                     priority=None, issue_type='Task', parent_key=None):
         """
-        Создает задачу в Jira.
+        Creates a Jira issue.
 
         Args:
-            project_key: Ключ проекта в Jira
-            summary: Заголовок задачи
-            description: Описание задачи
-            assignee: ID исполнителя (необязательно)
-            due_date: Срок выполнения (необязательно)
-            priority: Приоритет задачи (необязательно)
-            issue_type: Тип задачи (по умолчанию 'Task')
+            project_key: Jira project key
+            summary: Issue summary
+            description: Issue description
+            assignee: Assignee email or username
+            due_date: Due date
+            priority: Priority (High, Medium, Low)
+            issue_type: Issue type (default: Task)
+            parent_key: Parent issue key for sub-tasks
 
         Returns:
-            Созданная задача или None в случае ошибки
+            Created issue or None on error
         """
         if not self.client:
             logger.error("Jira client is not initialized")
@@ -72,18 +73,43 @@ class JiraClient:
             }
 
             if assignee:
-                # Находим пользователя по имени
-                user = self.find_user(assignee)
+                # First, try to find user by email
+                user = None
+                try:
+                    # Try exact email match first
+                    users_by_email = self.client.search_users(query=assignee, property="email")
+                    if users_by_email:
+                        user = users_by_email[0]
+                        logger.info(f"Found user by email: {user.displayName}")
+                except Exception as e:
+                    logger.warning(f"Error searching by email: {str(e)}")
+
+                # If not found by email, try by display name
+                if not user:
+                    try:
+                        users_by_name = self.client.search_users(query=assignee)
+                        if users_by_name:
+                            user = users_by_name[0]
+                            logger.info(f"Found user by name: {user.displayName}")
+                    except Exception as e:
+                        logger.warning(f"Error searching by name: {str(e)}")
+
+                # If user found, assign the issue
                 if user:
                     issue_dict['assignee'] = {'accountId': user.accountId}
                 else:
-                    logger.warning(f"User {assignee} not found in Jira, issue will be created without assignee")
+                    logger.warning(f"User {assignee} not found in Jira")
 
             if due_date:
                 issue_dict['duedate'] = due_date.strftime('%Y-%m-%d')
 
             if priority:
                 issue_dict['priority'] = {'name': priority}
+
+            # If parent key is provided, create a sub-task
+            if parent_key:
+                issue_dict['parent'] = {'key': parent_key}
+                issue_dict['issuetype'] = {'name': 'Sub-task'}
 
             issue = self.client.create_issue(fields=issue_dict)
             logger.info(f"Created Jira issue {issue.key}: {summary}")

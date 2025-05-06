@@ -32,6 +32,7 @@ class Task(Base):
     name = Column(String, nullable=False)
     duration = Column(Integer, nullable=False)
     position = Column(String, nullable=False)
+    required_employees = Column(Integer, default=1)  # Add this line
 
     project = relationship("Project", back_populates="tasks")
     predecessors = relationship(
@@ -114,6 +115,7 @@ class TaskTemplate(Base):
     duration = Column(Integer, nullable=False)
     position = Column(String, nullable=False)
     order = Column(Integer, nullable=False)  # Порядок задачи в шаблоне
+    required_employees = Column(Integer, default=1)  # Number of required employees
 
     project_template = relationship("ProjectTemplate", back_populates="tasks")
     dependencies = relationship(

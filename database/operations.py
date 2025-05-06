@@ -86,25 +86,27 @@ def add_task_dependencies(task_id, predecessor_id):
         session.close()
 
 
-def add_project_employee(project_id, name, position, days_off):
+def add_project_employee(project_id, name, position, days_off, email=None):
     """
-    Добавляет сотрудника в проект.
+    Adds an employee to a project.
 
     Args:
-        project_id: ID проекта
-        name: ФИО сотрудника
-        position: Должность сотрудника
-        days_off: Список выходных дней
+        project_id: ID of the project
+        name: Full name of the employee
+        position: Position of the employee
+        days_off: List of days off
+        email: Email of the employee (optional)
 
     Returns:
-        ID созданного сотрудника
+        ID of the created employee
     """
     session = Session()
     try:
         employee = Employee(
             project_id=project_id,
             name=name,
-            position=position
+            position=position,
+            email=email
         )
         session.add(employee)
         session.flush()
@@ -159,15 +161,16 @@ def get_employees_by_position(project_id, position=None):
     finally:
         session.close()
 
+
 def get_project_data(project_id):
     """
-    Получает данные проекта из БД.
+    Gets project data from the database.
 
     Args:
-        project_id: ID проекта
+        project_id: Project ID
 
     Returns:
-        Словарь с данными проекта
+        Project data dictionary
     """
     session = Session()
     try:
@@ -176,12 +179,13 @@ def get_project_data(project_id):
         if not project:
             return None
 
-        # Получаем задачи проекта
+        # Get project tasks
         tasks = session.query(Task).filter(Task.project_id == project_id).all()
-        tasks_data = []
+        print(f"Database tasks for project {project_id}: {len(tasks)}")
 
+        tasks_data = []
         for task in tasks:
-            # Получаем зависимости задачи
+            # Get task dependencies
             dependencies = session.query(TaskDependency).filter(TaskDependency.task_id == task.id).all()
             predecessor_ids = [dep.predecessor_id for dep in dependencies]
 
@@ -193,12 +197,11 @@ def get_project_data(project_id):
                 'predecessors': predecessor_ids
             })
 
-        # Получаем сотрудников проекта
+        # Get project employees
         employees = session.query(Employee).filter(Employee.project_id == project_id).all()
         employees_data = []
 
         for employee in employees:
-            # Получаем выходные дни сотрудника
             days_off = session.query(DayOff).filter(DayOff.employee_id == employee.id).all()
             days_off_list = [day.day for day in days_off]
 
@@ -206,7 +209,7 @@ def get_project_data(project_id):
                 'id': employee.id,
                 'name': employee.name,
                 'position': employee.position,
-                'email': employee.email,  # Добавляем email в результат
+                'email': employee.email,
                 'days_off': days_off_list
             })
 
@@ -241,7 +244,7 @@ def create_project_template(name, description=None):
         session.close()
 
 
-def add_task_template(template_id, name, duration, position, order=0):
+def add_task_template(template_id, name, duration, position, order=0,required_employees=1):
     """
     Добавляет шаблон задачи в шаблон проекта.
 
@@ -251,6 +254,7 @@ def add_task_template(template_id, name, duration, position, order=0):
         duration: Длительность задачи в днях
         position: Должность исполнителя
         order: Порядковый номер задачи
+        required_employees: Number of employees required (default: 1)
 
     Returns:
         ID созданного шаблона задачи
@@ -262,7 +266,8 @@ def add_task_template(template_id, name, duration, position, order=0):
             name=name,
             duration=duration,
             position=position,
-            order=order
+            order=order,
+            required_employees=required_employees
         )
         session.add(task)
         session.commit()
@@ -356,44 +361,48 @@ def get_template_tasks(template_id):
 
 def create_project_from_template(template_id, project_name):
     """
-    Создает проект на основе шаблона.
+    Creates a project based on a template.
 
     Args:
-        template_id: ID шаблона проекта
-        project_name: Название нового проекта
+        template_id: ID of the project template
+        project_name: Name of the new project
 
     Returns:
-        ID созданного проекта
+        ID of the created project
     """
     session = Session()
     try:
-        # Создаем новый проект
+        # Create a new project
         project = Project(name=project_name)
         session.add(project)
         session.flush()
 
-        # Получаем задачи шаблона
+        # Get template tasks
         template_tasks = session.query(TaskTemplate).filter(TaskTemplate.template_id == template_id).order_by(
             TaskTemplate.order).all()
 
-        # Словарь для соответствия ID шаблона задачи -> ID созданной задачи
+        # Dictionary to map template task ID to created task ID
         task_id_map = {}
 
-        # Создаем задачи для проекта
+        # Create tasks for the project
         for template_task in template_tasks:
+            # Check if the template_task has required_employees attribute
+            req_employees = getattr(template_task, 'required_employees', 1)
+
             task = Task(
                 project_id=project.id,
                 name=template_task.name,
                 duration=template_task.duration,
-                position=template_task.position
+                position=template_task.position,
+                required_employees=req_employees
             )
             session.add(task)
             session.flush()
 
-            # Сохраняем соответствие ID
+            # Save ID mapping
             task_id_map[template_task.id] = task.id
 
-        # Добавляем зависимости между задачами
+        # Add dependencies between tasks
         for template_task in template_tasks:
             dependencies = session.query(TaskTemplateDependency).filter(
                 TaskTemplateDependency.task_id == template_task.id).all()

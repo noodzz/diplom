@@ -11,59 +11,81 @@ logger = logging.getLogger(__name__)
 
 def create_jira_issues(calendar_plan):
     """
-    Создает задачи в Jira на основе календарного плана.
+    Creates Jira issues based on calendar plan.
 
     Args:
-        calendar_plan: Календарный план с задачами
+        calendar_plan: Calendar plan with tasks
 
     Returns:
-        Список созданных задач или пустой список в случае ошибки
+        List of created issues
     """
     client = JiraClient()
 
-    # Проверяем подключение к Jira
     if not client.is_connected():
         logger.error("Cannot create Jira issues: Jira client is not connected")
         return []
 
     tasks = calendar_plan['tasks']
-
-    # Словарь для хранения созданных задач (id задачи -> jira_integration key)
     jira_issues = {}
     created_issues = []
 
-    # Создаем все задачи
+    # First create parent tasks for multi-assignee tasks
+    parent_tasks = {}
     for task in tasks:
-        # Формируем заголовок и описание задачи
+        # Check if this is a task that requires multiple employees
+        if 'required_employees' in task and task['required_employees'] > 1:
+            # Create parent task if not already created
+            if task['name'] not in parent_tasks:
+                summary = f"{task['name']} (Group Task)"
+                description = f"Parent task for {task['name']} requiring {task['required_employees']} employees."
+
+                # Create parent issue with Medium priority
+                issue = client.create_issue(
+                    project_key=JIRA_PROJECT_KEY,
+                    summary=summary,
+                    description=description,
+                    priority="Medium"
+                )
+
+                if issue:
+                    parent_tasks[task['name']] = issue.key
+
+    # Now create individual tasks
+    for task in tasks:
         summary = task['name']
         description = format_task_description(task)
 
-        # Определяем приоритет задачи (критические задачи имеют высокий приоритет)
+        # Set priority based on whether task is critical
         priority = "High" if task['is_critical'] else "Medium"
 
-        # Используем email сотрудника если он доступен, иначе используем имя
-        assignee = task.get('employee_email') if task.get('employee_email') else task['employee']
+        # Use email if available, otherwise use name
+        assignee = (task.get('employee_email') or '').strip()
+        if not assignee:
+            logger.warning(f"No email for employee: {task.get('employee')}, using name instead")
+            assignee = task.get('employee')
 
-        # Создаем задачу в Jira
+        # Create the issue
+        parent_key = parent_tasks.get(task['name'])
         issue = client.create_issue(
             project_key=JIRA_PROJECT_KEY,
             summary=summary,
             description=description,
             assignee=assignee,
-            due_date=task['end_date'],
-            priority=priority
+            due_date=task.get('end_date'),
+            priority=priority,
+            parent_key=parent_key
         )
 
         if issue:
             jira_issues[task['id']] = issue.key
-
             created_issues.append({
                 'key': issue.key,
                 'summary': summary,
-                'assignee': assignee
+                'assignee': assignee,
+                'priority': priority
             })
 
-    # Устанавливаем зависимости между задачами
+    # Create dependencies (but in the correct direction)
     create_task_dependencies(client, tasks, jira_issues)
 
     return created_issues
@@ -103,41 +125,50 @@ h2. Внимание
 
 def create_task_dependencies(client, tasks, jira_issues):
     """
-    Создает зависимости между задачами в Jira.
+    Creates dependencies between Jira issues.
 
     Args:
-        client: Клиент Jira
-        tasks: Список задач из календарного плана
-        jira_issues: Словарь соответствия id задачи -> jira_integration key
+        client: Jira client
+        tasks: Tasks from calendar plan
+        jira_issues: Dictionary mapping task IDs to Jira issue keys
     """
-    # Получаем доступные типы связей
+    # Get available link types
     link_types = client.get_available_link_types()
 
-    # Определяем тип связи для зависимостей
-    # В разных инсталляциях Jira могут быть разные типы связей
-    # Пытаемся найти подходящий тип связи
+    # Find appropriate link type for dependencies
     dependency_link_type = None
     for link_type in link_types:
         if "depend" in link_type.lower() or "block" in link_type.lower():
             dependency_link_type = link_type
             break
 
-    # Если подходящий тип связи не найден, используем первый доступный
     if not dependency_link_type and link_types:
         dependency_link_type = link_types[0]
 
-    # Если нет доступных типов связей, выходим
     if not dependency_link_type:
         logger.warning("No link types available in Jira, dependencies will not be created")
         return
 
-    # Создаем зависимости между задачами
+    # Build a dictionary of task IDs to predecessor IDs for easier lookup
+    task_predecessors = {}
     for task in tasks:
-        if 'predecessors' in task and task['predecessors']:
-            for predecessor_id in task['predecessors']:
-                if predecessor_id in jira_issues and task['id'] in jira_issues:
-                    client.create_dependency(
-                        jira_issues[task['id']],
-                        jira_issues[predecessor_id],
-                        dependency_link_type
-                    )
+        task_id = task['id']
+        predecessors = task.get('predecessors', [])
+        task_predecessors[task_id] = predecessors
+
+    # Create dependencies
+    for task in tasks:
+        task_id = task['id']
+        predecessors = task_predecessors.get(task_id, [])
+
+        for predecessor_id in predecessors:
+            if predecessor_id in jira_issues and task_id in jira_issues:
+                # IMPORTANT: This is the fix - make sure dependencies are created in the right direction
+                # A depends on B means B blocks A
+                # So if task depends on predecessor, then predecessor blocks task
+                client.create_dependency(
+                    issue_key=jira_issues[task_id],  # Dependent issue (blocked by)
+                    depends_on_key=jira_issues[predecessor_id],  # Blocking issue (blocks)
+                    link_type=dependency_link_type
+                )
+                logger.info(f"Created dependency: {jira_issues[task_id]} depends on {jira_issues[predecessor_id]}")
