@@ -1,6 +1,6 @@
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from datetime import datetime
 
 from config import DATABASE_URL
@@ -31,8 +31,9 @@ class Task(Base):
     project_id = Column(Integer, ForeignKey('projects.id'), nullable=False)
     name = Column(String, nullable=False)
     duration = Column(Integer, nullable=False)
-    position = Column(String, nullable=False)
-    required_employees = Column(Integer, default=1)  # Add this line
+    position = Column(String, nullable=True)  # Может быть null для родительских задач
+    required_employees = Column(Integer, default=1)
+    parent_id = Column(Integer, ForeignKey('tasks.id'), nullable=True)  # ID родительской задачи
 
     project = relationship("Project", back_populates="tasks")
     predecessors = relationship(
@@ -40,10 +41,10 @@ class Task(Base):
         foreign_keys="[TaskDependency.task_id]",
         back_populates="task"
     )
+    subtasks = relationship("Task", backref=backref("parent", remote_side=[id]))  # Связь с подзадачами
 
     def __repr__(self):
         return f"<Task(id={self.id}, name='{self.name}', duration={self.duration})>"
-
 
 class TaskDependency(Base):
     """Модель зависимости между задачами в БД."""
@@ -140,3 +141,34 @@ class TaskTemplateDependency(Base):
 
     def __repr__(self):
         return f"<TaskTemplateDependency(task_id={self.task_id}, predecessor_id={self.predecessor_id})>"
+
+class AllowedUser(Base):
+    """Модель разрешенного пользователя в БД."""
+    __tablename__ = 'allowed_users'
+
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False)
+    name = Column(String, nullable=True)
+    added_by = Column(Integer, nullable=True)  # ID администратора, добавившего пользователя
+    added_at = Column(DateTime, default=datetime.now)
+    is_admin = Column(Boolean, default=False)  # Флаг администратора
+
+    def __repr__(self):
+        return f"<AllowedUser(telegram_id={self.telegram_id}, name='{self.name}')>"
+
+class TaskPart(Base):
+    """Модель части задачи в БД."""
+    __tablename__ = 'task_parts'
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(Integer, ForeignKey('tasks.id'), nullable=False)
+    name = Column(String, nullable=False)
+    position = Column(String, nullable=False)  # Должность для этой части
+    duration = Column(Integer, nullable=False)  # Длительность этой части в днях
+    order = Column(Integer, nullable=False)  # Порядок выполнения части
+    required_employees = Column(Integer, default=1)
+
+    task = relationship("Task", back_populates="parts")
+
+    def __repr__(self):
+        return f"<TaskPart(id={self.id}, name='{self.name}', position='{self.position}')>"

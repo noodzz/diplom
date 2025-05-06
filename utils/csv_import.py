@@ -3,12 +3,13 @@
 """
 import csv
 import io
+import json
 import logging
 from database.operations import (
     create_new_project, add_project_task,
     add_task_dependencies, Session
 )
-from database.models import Project, Task, TaskDependency
+from database.models import Project, Task, TaskDependency, TaskPart
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,10 @@ def parse_csv_tasks(csv_data):
     Парсит CSV-файл с задачами.
 
     Формат CSV:
-    name,duration,position,predecessors
+    name,duration,position,predecessors,required_employees,assignee_roles
+
+    Где assignee_roles - опциональное JSON-поле с описанием ролей и их продолжительностей:
+    [{"position":"Технический специалист","duration":1},{"position":"Старший технический специалист","duration":2}]
 
     Args:
         csv_data: Содержимое CSV-файла
@@ -38,29 +42,51 @@ def parse_csv_tasks(csv_data):
 
         for row in reader:
             # Проверяем наличие обязательных полей
-            if not all(field in row for field in ['name', 'duration', 'position']):
+            if not all(field in row for field in ['name', 'duration']):
                 logger.error("В CSV отсутствуют обязательные поля")
                 return []
 
             try:
                 # Пытаемся преобразовать длительность в число
                 duration = int(row['duration'])
-            except ValueError:
-                logger.error(f"Некорректная длительность для задачи: {row['name']}")
+
+                # Пытаемся преобразовать количество сотрудников в число,
+                # если поле есть, иначе устанавливаем 1 по умолчанию
+                required_employees = 1
+                if 'required_employees' in row and row['required_employees']:
+                    required_employees = int(row['required_employees'])
+
+                # Проверяем наличие поля assignee_roles и пытаемся его распарсить
+                assignee_roles = []
+                if 'assignee_roles' in row and row['assignee_roles']:
+                    try:
+                        assignee_roles = json.loads(row['assignee_roles'])
+                    except json.JSONDecodeError:
+                        logger.error(f"Некорректный JSON в поле assignee_roles для задачи: {row['name']}")
+                        return []
+
+                # Определяем, имеет ли задача несколько исполнителей с разными ролями
+                has_multiple_roles = len(assignee_roles) > 0
+
+                task = {
+                    'name': row['name'],
+                    'duration': duration,
+                    'position': row.get('position', '') if not has_multiple_roles else '',
+                    'required_employees': required_employees if not has_multiple_roles else 1,
+                    'predecessors': [],
+                    'has_multiple_roles': has_multiple_roles,
+                    'assignee_roles': assignee_roles
+                }
+
+                # Парсим предшественников, если они указаны
+                if 'predecessors' in row and row['predecessors']:
+                    task['predecessors'] = [pred.strip() for pred in row['predecessors'].split(',')]
+
+                tasks.append(task)
+
+            except ValueError as e:
+                logger.error(f"Некорректные числовые значения для задачи: {row['name']}: {str(e)}")
                 return []
-
-            task = {
-                'name': row['name'],
-                'duration': duration,
-                'position': row['position'],
-                'predecessors': []
-            }
-
-            # Парсим предшественников, если они указаны
-            if 'predecessors' in row and row['predecessors']:
-                task['predecessors'] = [pred.strip() for pred in row['predecessors'].split(',')]
-
-            tasks.append(task)
 
         # Проверяем корректность зависимостей
         task_names = {task['name'] for task in tasks}
@@ -101,7 +127,7 @@ def validate_csv_format(csv_content):
             return False, "CSV-файл пуст"
 
         # Проверяем наличие всех необходимых полей
-        required_fields = ['name', 'duration', 'position']
+        required_fields = ['name', 'duration']
         missing_fields = [field for field in required_fields if field not in header]
 
         if missing_fields:
@@ -148,28 +174,70 @@ def create_project_from_csv(project_name, csv_data):
 
         # Создаем задачи для проекта
         for task_data in tasks:
-            task = Task(
-                project_id=project.id,
-                name=task_data['name'],
-                duration=task_data['duration'],
-                position=task_data['position']
-            )
-            session.add(task)
-            session.flush()
+            # Проверяем, имеет ли задача несколько исполнителей с разными ролями
+            if task_data.get('has_multiple_roles') and task_data.get('assignee_roles'):
+                # Создаем родительскую задачу
+                parent_task = Task(
+                    project_id=project.id,
+                    name=task_data['name'],
+                    duration=task_data['duration'],
+                    position='',  # Родительская задача не имеет конкретной должности
+                    required_employees=1
+                )
+                session.add(parent_task)
+                session.flush()
 
-            # Сохраняем соответствие название -> ID
-            task_name_map[task_data['name']] = task.id
+                task_name_map[task_data['name']] = parent_task.id
+
+                # Создаем подзадачи для каждой роли
+                for i, role in enumerate(task_data['assignee_roles']):
+                    subtask_name = f"{task_data['name']} - {role['position']}"
+                    subtask = Task(
+                        project_id=project.id,
+                        name=subtask_name,
+                        duration=role['duration'],
+                        position=role['position'],
+                        required_employees=1,
+                        parent_id=parent_task.id
+                    )
+                    session.add(subtask)
+                    session.flush()
+
+                    # Добавляем зависимость от предыдущей подзадачи, если она есть
+                    if i > 0:
+                        prev_subtask_id = subtask.id - 1  # Предыдущая подзадача
+                        task_dependency = TaskDependency(
+                            task_id=subtask.id,
+                            predecessor_id=prev_subtask_id
+                        )
+                        session.add(task_dependency)
+            else:
+                # Обычная задача
+                task = Task(
+                    project_id=project.id,
+                    name=task_data['name'],
+                    duration=task_data['duration'],
+                    position=task_data['position'],
+                    required_employees=task_data.get('required_employees', 1)
+                )
+                session.add(task)
+                session.flush()
+
+                task_name_map[task_data['name']] = task.id
 
         # Добавляем зависимости между задачами
         for task_data in tasks:
             if 'predecessors' in task_data and task_data['predecessors']:
-                for predecessor_name in task_data['predecessors']:
-                    if predecessor_name in task_name_map:
-                        task_dependency = TaskDependency(
-                            task_id=task_name_map[task_data['name']],
-                            predecessor_id=task_name_map[predecessor_name]
-                        )
-                        session.add(task_dependency)
+                task_id = task_name_map.get(task_data['name'])
+                if task_id:
+                    for predecessor_name in task_data['predecessors']:
+                        predecessor_id = task_name_map.get(predecessor_name)
+                        if predecessor_id:
+                            task_dependency = TaskDependency(
+                                task_id=task_id,
+                                predecessor_id=predecessor_id
+                            )
+                            session.add(task_dependency)
 
         session.commit()
         logger.info(f"Создан проект из CSV: {project_name} (ID: {project.id})")
@@ -191,14 +259,15 @@ def generate_sample_csv():
     Returns:
         Строка с примером CSV
     """
-    sample_data = """name,duration,position,predecessors
-Расчёт стоимостей,3,Проектный менеджер,
-Создание тарифов обучения,1,Технический специалист,Расчёт стоимостей
-Создание продуктовых типов и продуктов,2,Старший тех. специалист,Создание тарифов обучения
-Создание потоков обучения,2,Старший тех. специалист,Создание продуктовых типов и продуктов
-Создание тарифов для внешнего сайта,1,Старший тех. специалист,Создание тарифов обучения
-Создание модулей обучения,2,Руководитель контента,
-Настройка связей между потоками и модулями,1,Старший специалист,"Создание потоков обучения,Создание модулей обучения"
+    sample_data = """name,duration,position,predecessors,required_employees,assignee_roles
+Расчёт стоимостей,3,Проектный менеджер,,1,
+Создание тарифов обучения,1,Технический специалист,Расчёт стоимостей,1,
+Создание продуктовых типов и продуктов,2,Старший тех. специалист,Создание тарифов обучения,2,
+Создание потоков обучения,2,Старший тех. специалист,Создание продуктовых типов и продуктов,2,
+Создание тарифов для внешнего сайта,1,Старший тех. специалист,Создание тарифов обучения,1,
+Создание модулей обучения,2,Руководитель контента,,2,
+Настройка связей между потоками и модулями,1,Старший специалист,"Создание потоков обучения,Создание модулей обучения",1,
+Создание и настройка интерфейса,3,,"Создание тарифов обучения",1,"[{""position"":""Технический специалист"",""duration"":1},{""position"":""Старший технический специалист"",""duration"":2}]"
 """
     return sample_data
 
@@ -238,7 +307,7 @@ def export_project_to_csv(project_id):
         writer = csv.writer(output)
 
         # Записываем заголовок
-        writer.writerow(['name', 'duration', 'position', 'predecessors'])
+        writer.writerow(['name', 'duration', 'position', 'predecessors', 'required_employees'])
 
         # Записываем данные задач
         for task in tasks:
@@ -251,7 +320,8 @@ def export_project_to_csv(project_id):
                 task.name,
                 task.duration,
                 task.position,
-                ','.join(predecessors)
+                ','.join(predecessors),
+                task.required_employees
             ])
 
         return output.getvalue()

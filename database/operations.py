@@ -1,6 +1,9 @@
+from contextlib import contextmanager
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from database.models import Base, Project, Task, TaskDependency, Employee, DayOff, ProjectTemplate, TaskTemplate, TaskTemplateDependency
+from database.models import Base, Project, Task, TaskDependency, Employee, DayOff, ProjectTemplate, TaskTemplate, \
+    TaskTemplateDependency, AllowedUser
 from config import DATABASE_URL
 from logger import logger
 
@@ -460,5 +463,126 @@ def get_user_projects(user_id=None):
     except Exception as e:
         logger.error(f"Error retrieving projects: {str(e)}")
         return []
+    finally:
+        session.close()
+
+
+def is_user_allowed(telegram_id):
+    """
+    Проверяет, имеет ли пользователь доступ к боту.
+
+    Args:
+        telegram_id: Telegram ID пользователя
+
+    Returns:
+        bool: True, если пользователь имеет доступ, иначе False
+    """
+    session = Session()
+    try:
+        user = session.query(AllowedUser).filter(AllowedUser.telegram_id == telegram_id).first()
+        return user is not None
+    finally:
+        session.close()
+
+
+def add_allowed_user(telegram_id, name=None, added_by=None, is_admin=False):
+    """
+    Добавляет пользователя в список разрешенных.
+
+    Args:
+        telegram_id: Telegram ID пользователя
+        name: Имя пользователя (опционально)
+        added_by: ID администратора, добавившего пользователя (опционально)
+        is_admin: Флаг администратора (по умолчанию False)
+
+    Returns:
+        bool: True, если пользователь успешно добавлен, иначе False
+    """
+    session = Session()
+    try:
+        # Проверяем, не добавлен ли пользователь уже
+        existing = session.query(AllowedUser).filter(AllowedUser.telegram_id == telegram_id).first()
+        if existing:
+            return False
+
+        user = AllowedUser(
+            telegram_id=telegram_id,
+            name=name,
+            added_by=added_by,
+            is_admin=is_admin
+        )
+        session.add(user)
+        session.commit()
+        return True
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при добавлении пользователя: {str(e)}")
+        return False
+    finally:
+        session.close()
+
+
+def get_allowed_users():
+    """
+    Получает список всех разрешенных пользователей.
+
+    Returns:
+        List[dict]: Список словарей с данными пользователей
+    """
+    session = Session()
+    try:
+        users = session.query(AllowedUser).all()
+        result = []
+
+        for user in users:
+            result.append({
+                'id': user.id,
+                'telegram_id': user.telegram_id,
+                'name': user.name,
+                'is_admin': user.is_admin,
+                'added_at': user.added_at.strftime("%d.%m.%Y %H:%M")
+            })
+
+        return result
+    finally:
+        session.close()
+
+
+def remove_allowed_user(telegram_id):
+    """
+    Удаляет пользователя из списка разрешенных.
+
+    Args:
+        telegram_id: Telegram ID пользователя
+
+    Returns:
+        bool: True, если пользователь успешно удален, иначе False
+    """
+    with session_scope() as session:
+        user = session.query(AllowedUser).filter(
+            AllowedUser.telegram_id == telegram_id
+        ).first()
+
+        if not user:
+            return False
+
+        session.delete(user)
+        return True
+
+@contextmanager
+def session_scope():
+    """
+    Контекстный менеджер для работы с сессиями SQLAlchemy.
+    Автоматически выполняет commit при успешном завершении
+    и rollback при возникновении исключения.
+    """
+    session = Session()
+    try:
+        yield session
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при работе с БД: {str(e)}")
+        raise
     finally:
         session.close()

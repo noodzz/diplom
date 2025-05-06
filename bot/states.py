@@ -12,4 +12,5 @@ class BotStates(Enum):
     ADD_EMPLOYEES = auto()
     CALCULATE_PLAN = auto()
     SHOW_PLAN = auto()
-    SELECT_PROJECT = auto()  # Новое состояние для выбора проекта из списка
+    SELECT_PROJECT = auto()
+    SET_START_DATE = auto()

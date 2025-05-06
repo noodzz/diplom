@@ -1,5 +1,7 @@
 from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
+
+import logger
 from bot.states import BotStates
 from bot.keyboards import (
     main_menu_keyboard, project_type_keyboard, templates_keyboard,
@@ -10,12 +12,15 @@ from bot.messages import (
     WELCOME_MESSAGE, HELP_MESSAGE, SELECT_PROJECT_TYPE_MESSAGE,
     SELECT_TEMPLATE_PROMPT, UPLOAD_CSV_PROMPT, CREATE_PROJECT_PROMPT,
     ADD_TASK_PROMPT, ADD_DEPENDENCIES_PROMPT, ADD_EMPLOYEES_PROMPT,
-    PLAN_CALCULATION_START, EXPORT_TO_JIRA_SUCCESS, CSV_FORMAT_ERROR
+    PLAN_CALCULATION_START, EXPORT_TO_JIRA_SUCCESS, CSV_FORMAT_ERROR, MY_ID_MESSAGE
 )
+from config import ALLOWED_USERS
+from database.models import AllowedUser
 from database.operations import (
     create_new_project, add_project_task, add_task_dependencies,
     add_project_employee, get_project_data, get_employees_by_position,
-    get_project_templates, create_project_from_template, get_user_projects
+    get_project_templates, create_project_from_template, get_user_projects, get_allowed_users, add_allowed_user,
+    is_user_allowed, session_scope
 )
 from utils.csv_import import create_project_from_csv, parse_csv_tasks
 from planning.network import calculate_network_parameters
@@ -127,6 +132,179 @@ async def select_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return BotStates.CREATE_PROJECT
 
+
+async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for setting project start date."""
+    query = update.callback_query
+    await query.answer()
+
+    # Update the message to ask for a start date
+    await query.edit_message_text(
+        "Укажите дату начала проекта в формате ДД.ММ.ГГГГ (например, 06.05.2025).\n\n"
+        "Можно также указать 'сегодня', 'завтра' или '+N' (где N - количество дней от текущей даты).",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Сегодня", callback_data="date_today"),
+            InlineKeyboardButton("Завтра", callback_data="date_tomorrow")
+        ], [
+            InlineKeyboardButton("Через неделю", callback_data="date_plus7"),
+            InlineKeyboardButton("Через 2 недели", callback_data="date_plus14")
+        ], [
+            InlineKeyboardButton("Отмена", callback_data="back_to_project")
+        ]])
+    )
+
+    return BotStates.SET_START_DATE
+
+
+async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Process the start date input from user."""
+    from datetime import datetime, timedelta
+
+    if update.callback_query:
+        # Handle quick date selections
+        query = update.callback_query
+        await query.answer()
+
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if query.data == "date_today":
+            start_date = today
+        elif query.data == "date_tomorrow":
+            start_date = today + timedelta(days=1)
+        elif query.data == "date_plus7":
+            start_date = today + timedelta(days=7)
+        elif query.data == "date_plus14":
+            start_date = today + timedelta(days=14)
+        elif query.data == "back_to_project":
+            # User canceled, go back to project view
+            return await select_project(update, context)
+
+        # Store the date in context
+        context.user_data['project_start_date'] = start_date
+
+        # Return to project view with confirmation
+        project_id = context.user_data.get('current_project_id')
+        if project_id:
+            await show_project_with_message(
+                query,
+                context,
+                project_id,
+                f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}"
+            )
+        else:
+            await query.edit_message_text(
+                f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}",
+                reply_markup=main_menu_keyboard()
+            )
+        return BotStates.ADD_TASK
+        # Handle text input for custom date
+    text = update.message.text.strip()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    try:
+        if text.lower() == 'сегодня':
+            start_date = today
+        elif text.lower() == 'завтра':
+            start_date = today + timedelta(days=1)
+        elif text.startswith('+'):
+            # Handle relative dates like "+5"
+            days = int(text[1:])
+            start_date = today + timedelta(days=days)
+        else:
+            # Parse date in DD.MM.YYYY format
+            start_date = datetime.strptime(text, '%d.%m.%Y')
+
+        # Store the date in context
+        context.user_data['project_start_date'] = start_date
+
+        # Confirm the date setting
+        await update.message.reply_text(
+            f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")
+            ], [
+                InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")
+            ]])
+        )
+        return BotStates.ADD_TASK
+
+    except (ValueError, IndexError):
+        # Handle invalid date format
+        await update.message.reply_text(
+            "Неверный формат даты. Пожалуйста, укажите дату в формате ДД.ММ.ГГГГ (например, 06.05.2025) "
+            "или используйте 'сегодня', 'завтра' или '+N' дней.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Отмена", callback_data="back_to_project")
+            ]])
+        )
+        return BotStates.SET_START_DATE
+
+
+async def show_project_with_message(query, context, project_id, message):
+    """Show project details with a message."""
+    # Get project data
+    project_data = get_project_data(project_id)
+
+    if not project_data:
+        await query.edit_message_text(
+            "Проект не найден или был удален.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Format project information with the message
+    project_info = format_project_info(project_data, context)
+
+    await query.edit_message_text(
+        f"{message}\n\n{project_info}",
+        reply_markup=get_project_keyboard(project_data),
+        parse_mode='Markdown'
+    )
+    return BotStates.ADD_TASK
+
+
+def format_project_info(project_data, context):
+    """Format project information including start date if set."""
+    # Basic project info
+    message = f"📊 *Проект: {project_data['name']}*\n\n"
+
+    # Add start date if set
+    start_date = context.user_data.get('project_start_date')
+    if start_date:
+        message += f"*Дата начала:* {start_date.strftime('%d.%m.%Y')}\n\n"
+
+    # Information about tasks
+    message += f"*Задачи:* {len(project_data['tasks'])}\n\n"
+
+    if project_data['tasks']:
+        message += "*Список задач:*\n"
+        for i, task in enumerate(project_data['tasks'][:5]):  # Show only first 5 tasks
+            message += f"{i + 1}. {task['name']} ({task['duration']} дн.) - {task['position']}\n"
+
+        if len(project_data['tasks']) > 5:
+            message += f"... и еще {len(project_data['tasks']) - 5} задач\n"
+    else:
+        message += "Задачи еще не добавлены.\n"
+
+    message += "\n*Сотрудники:* "
+    if project_data['employees']:
+        message += f"{len(project_data['employees'])}\n"
+    else:
+        message += "пока не добавлены.\n"
+
+    return message
+
+def get_project_keyboard(project_data):
+    """Get keyboard for project actions."""
+    keyboard = [
+        [InlineKeyboardButton("Добавить задачи", callback_data="add_tasks")],
+        [InlineKeyboardButton("Добавить сотрудников", callback_data="add_employees")],
+        [InlineKeyboardButton("Установить дату начала", callback_data="set_start_date")],
+        [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+        [InlineKeyboardButton("Назад к списку проектов", callback_data="list_projects")],
+        [InlineKeyboardButton("Главное меню", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 async def upload_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик загрузки CSV-файла."""
@@ -526,8 +704,11 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Рассчитываем параметры сетевой модели
     network_parameters = calculate_network_parameters(project_data)
 
-    # Создаем календарный план с учетом выходных дней
-    calendar_plan = create_calendar_plan(network_parameters, project_data)
+    # Get the start date from context or use today
+    start_date = context.user_data.get('project_start_date')
+
+    # Создаем календарный план с учетом выходных дней и стартовой даты
+    calendar_plan = create_calendar_plan(network_parameters, project_data, start_date)
 
     # Сохраняем результаты в контексте
     context.user_data['calendar_plan'] = calendar_plan
@@ -538,11 +719,22 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gantt_image.save(gantt_buffer, format='PNG')
     gantt_buffer.seek(0)
 
+    # Format start and end dates for the report
+    start_date_str = start_date.strftime('%d.%m.%Y') if start_date else "не указана"
+
+    # Calculate end date based on start date and project duration
+    if start_date and 'project_duration' in calendar_plan:
+        from datetime import timedelta
+        end_date = start_date + timedelta(days=calendar_plan['project_duration'])
+        end_date_str = end_date.strftime('%d.%m.%Y')
+    else:
+        end_date_str = "не определена"
+
     # Формируем текстовый отчет
-    # Исправление: проверяем тип critical_path и обрабатываем соответственно
     if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
         # Если critical_path содержит словари, извлекаем имена задач
-        critical_path_text = "Критический путь: " + " -> ".join([task['name'] for task in calendar_plan['critical_path']])
+        critical_path_text = "Критический путь: " + " -> ".join(
+            [task['name'] for task in calendar_plan['critical_path']])
     elif calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], str):
         # Если critical_path уже содержит строки (имена задач)
         critical_path_text = "Критический путь: " + " -> ".join(calendar_plan['critical_path'])
@@ -555,6 +747,8 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = f"""
 Расчет календарного плана завершен!
 
+Дата начала проекта: {start_date_str}
+Дата окончания проекта: {end_date_str}
 Общая продолжительность проекта: {project_duration} дней
 
 {critical_path_text}
@@ -579,7 +773,6 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     return BotStates.SHOW_PLAN
-
 
 async def export_to_jira(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик экспорта задач в Jira."""
@@ -754,3 +947,171 @@ async def select_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     return BotStates.ADD_TASK  # Используем существующее состояние для работы с задачами
+
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик для добавления нового пользователя в список разрешенных.
+    Доступен только для администраторов.
+    """
+    user_id = update.effective_user.id
+
+    # Проверяем, является ли пользователь администратором через БД
+    if not is_admin_user(user_id):
+        await update.message.reply_text("У вас нет прав для выполнения этой операции.")
+        return
+
+    # Получаем ID нового пользователя из аргументов команды
+    if not context.args or len(context.args) < 1 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Пожалуйста, укажите ID пользователя и его имя для добавления.\n"
+            "Пример: /add_user 123456789 Иван Иванов"
+        )
+        return
+
+    new_user_id = int(context.args[0])
+
+    # Получаем имя пользователя, если оно указано
+    user_name = None
+    if len(context.args) > 1:
+        user_name = " ".join(context.args[1:])
+
+    # Проверяем, не добавлен ли пользователь уже
+    if is_user_allowed(new_user_id):
+        await update.message.reply_text(f"Пользователь с ID {new_user_id} уже имеет доступ.")
+        return
+
+    # Добавляем пользователя в БД
+    result = add_allowed_user(
+        telegram_id=new_user_id,
+        name=user_name,
+        added_by=user_id,
+        is_admin=False
+    )
+
+    if result:
+        await update.message.reply_text(
+            f"Пользователь с ID {new_user_id}" +
+            (f" ({user_name})" if user_name else "") +
+            " успешно добавлен в список разрешенных."
+        )
+        logger.info(f"Добавлен новый пользователь: {new_user_id}" + (f" ({user_name})" if user_name else ""))
+    else:
+        await update.message.reply_text(
+            f"Ошибка при добавлении пользователя с ID {new_user_id}. "
+            "Возможно, пользователь уже добавлен или произошла ошибка базы данных."
+        )
+
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик для вывода списка разрешенных пользователей.
+    Доступен только для администраторов.
+    """
+    user_id = update.effective_user.id
+
+    # Проверяем, является ли пользователь администратором
+    if not is_admin_user(user_id):
+        await update.message.reply_text("У вас нет прав для выполнения этой операции.")
+        return
+
+    # Получаем список разрешенных пользователей
+    users = get_allowed_users()
+
+    if not users:
+        await update.message.reply_text("Список разрешенных пользователей пуст.")
+        return
+
+    # Формируем сообщение со списком пользователей
+    message = "Список разрешенных пользователей:\n\n"
+
+    for i, user in enumerate(users, start=1):
+        admin_status = " (админ)" if user.get('is_admin') else ""
+        message += f"{i}. ID: {user['telegram_id']}"
+
+        if user.get('name'):
+            message += f" - {user['name']}"
+
+        message += admin_status
+
+        if user.get('added_at'):
+            message += f" (добавлен: {user['added_at']})"
+
+        message += "\n"
+
+    await update.message.reply_text(message)
+
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик для удаления пользователя из списка разрешенных.
+    Доступен только для администраторов.
+    """
+    user_id = update.effective_user.id
+
+    # Проверяем, является ли пользователь администратором
+    if not is_admin_user(user_id):
+        await update.message.reply_text("У вас нет прав для выполнения этой операции.")
+        return
+
+    # Получаем ID пользователя для удаления из аргументов команды
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Пожалуйста, укажите ID пользователя для удаления.\n"
+            "Пример: /remove_user 123456789"
+        )
+        return
+
+    target_user_id = int(context.args[0])
+
+    # Проверяем, является ли удаляемый пользователь администратором
+    if is_admin_user(target_user_id) and target_user_id != user_id:
+        await update.message.reply_text(
+            "Вы не можете удалить другого администратора. "
+            "Для удаления, пользователь должен сначала потерять права администратора."
+        )
+        return
+
+    # Удаляем пользователя из БД
+    from database.operations import remove_allowed_user
+    result = remove_allowed_user(target_user_id)
+
+    if result:
+        await update.message.reply_text(f"Пользователь с ID {target_user_id} успешно удален из списка разрешенных.")
+        logger.info(f"Удален пользователь: {target_user_id}")
+    else:
+        await update.message.reply_text(
+            f"Пользователь с ID {target_user_id} не найден в списке разрешенных или произошла ошибка при удалении."
+        )
+
+
+def is_admin_user(user_id):
+    """
+    Проверяет, является ли пользователь администратором.
+
+    Args:
+        user_id: Telegram ID пользователя
+
+    Returns:
+        bool: True, если пользователь администратор, иначе False
+    """
+    with session_scope() as session:
+        user = session.query(AllowedUser).filter(
+            AllowedUser.telegram_id == user_id,
+            AllowedUser.is_admin == True
+        ).first()
+
+        return user is not None
+
+
+async def get_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет пользователю его Telegram ID."""
+    user_id = update.effective_user.id
+    user_name = update.effective_user.username or update.effective_user.first_name
+
+    await update.message.reply_text(
+        MY_ID_MESSAGE.format(
+            user_id=user_id,
+            user_name=user_name
+        )
+    )

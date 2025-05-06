@@ -1,4 +1,5 @@
 # main.py
+from bot.middleware import authorization_middleware
 from logger import logger  # Import from the new logger module
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,7 +15,7 @@ from bot.handlers import (
     select_project_type, use_template, select_template, upload_csv, process_csv,
     create_project, add_task, list_projects, add_dependencies,
     add_employees, calculate_plan, export_to_jira, cancel,
-    back_to_main, back_to_project_type, select_project
+    back_to_main, back_to_project_type, select_project, process_start_date, add_user, list_users, remove_user
 )
 from bot.states import BotStates
 from config import BOT_TOKEN
@@ -27,6 +28,8 @@ def main():
 
     # Создание приложения и добавление обработчиков
     application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(MessageHandler(filters.ALL, authorization_middleware), group=-999)
 
     # Основной обработчик диалогов
     conv_handler = ConversationHandler(
@@ -80,12 +83,20 @@ def main():
                 CallbackQueryHandler(select_project_type, pattern='^create_project$'),
                 CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
             ],
+            BotStates.SET_START_DATE: [
+                CallbackQueryHandler(process_start_date, pattern='^date_'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_start_date),
+            ],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
     application.add_handler(conv_handler)
 
+    # Команды для управления пользователями
+    application.add_handler(CommandHandler('add_user', add_user))
+    application.add_handler(CommandHandler('list_users', list_users))
+    application.add_handler(CommandHandler('remove_user', remove_user))
     # Запуск бота
     logger.info("Бот запущен и готов к работе!")
     application.run_polling()

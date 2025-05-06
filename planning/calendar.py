@@ -6,20 +6,27 @@
 from datetime import datetime, timedelta
 
 
-def create_calendar_plan(network_parameters, project_data):
+def create_calendar_plan(network_parameters, project_data,start_date=None):
     """
     Creates a calendar plan considering employee days off.
 
     Args:
         network_parameters: Network model parameters
         project_data: Project data with employees and their days off
+        start_date: Optional start date for the project (default: today)
 
     Returns:
         Calendar plan with task start/end dates
     """
+    if start_date is None:
+        start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     network = network_parameters['network']
     employees = project_data['employees']
     critical_path = network_parameters['critical_path']
+
+    # Debug log: Print task count from the network
+    print(f"Tasks in network: {len(network)}")
+    print(f"Using project start date: {start_date.strftime('%d.%m.%Y')}")
 
     # Debug log: Print task count from the network
     print(f"Tasks in network: {len(network)}")
@@ -39,7 +46,6 @@ def create_calendar_plan(network_parameters, project_data):
         position_employee_map[position].append(employee)
 
     # Create calendar plan
-    start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     calendar_plan = {
         'tasks': [],
         'critical_path': [task['name'] for task in critical_path],

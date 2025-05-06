@@ -8,6 +8,30 @@ from config import JIRA_PROJECT_KEY
 
 logger = logging.getLogger(__name__)
 
+# Константы для категорий задач
+CATEGORY_PMS = "ПМы"
+CATEGORY_SETUP = "Настройка"
+CATEGORY_CONTENT = "Контент"
+
+# Маппинг должностей на категории
+POSITION_CATEGORY_MAP = {
+    # Должности категории "ПМы"
+    "проектный менеджер": CATEGORY_PMS,
+    "project manager": CATEGORY_PMS,
+    "менеджер": CATEGORY_PMS,
+
+    # Должности категории "Настройка"
+    "технический специалист": CATEGORY_SETUP,
+    "старший технический специалист": CATEGORY_SETUP,
+    "руководитель настройки": CATEGORY_SETUP,
+    "руководитель сектора настройки": CATEGORY_SETUP,
+
+    # Должности категории "Контент"
+    "младший специалист": CATEGORY_CONTENT,
+    "старший специалист": CATEGORY_CONTENT,
+    "руководитель контента": CATEGORY_CONTENT
+}
+
 
 def create_jira_issues(calendar_plan):
     """
@@ -29,74 +53,229 @@ def create_jira_issues(calendar_plan):
     jira_issues = {}
     created_issues = []
 
-    # First create parent tasks for multi-assignee tasks
-    parent_tasks = {}
+    # Группируем задачи по имени
+    tasks_by_name = {}
     for task in tasks:
-        # Check if this is a task that requires multiple employees
-        if 'required_employees' in task and task['required_employees'] > 1:
-            # Create parent task if not already created
-            if task['name'] not in parent_tasks:
-                summary = f"{task['name']} (Group Task)"
-                description = f"Parent task for {task['name']} requiring {task['required_employees']} employees."
+        name = task['name']
+        if name not in tasks_by_name:
+            tasks_by_name[name] = []
+        tasks_by_name[name].append(task)
 
-                # Create parent issue with Medium priority
-                issue = client.create_issue(
-                    project_key=JIRA_PROJECT_KEY,
-                    summary=summary,
-                    description=description,
-                    priority="Medium"
-                )
+    # Обрабатываем каждую группу задач
+    for task_name, task_group in tasks_by_name.items():
+        # Если у задачи несколько исполнителей с разными должностями
+        if len(task_group) > 1:
+            # Создаем родительскую задачу
+            parent_summary = task_name
+            parent_description = format_parent_task_description(task_group)
 
-                if issue:
-                    parent_tasks[task['name']] = issue.key
+            # Определяем приоритет по наличию критических подзадач
+            priority = "High" if any(task['is_critical'] for task in task_group) else "Medium"
 
-    # Now create individual tasks
-    for task in tasks:
-        summary = task['name']
-        description = format_task_description(task)
+            # Создаем родительскую задачу
+            parent_issue = client.create_issue(
+                project_key=JIRA_PROJECT_KEY,
+                summary=parent_summary,
+                description=parent_description,
+                priority=priority
+            )
 
-        # Set priority based on whether task is critical
-        priority = "High" if task['is_critical'] else "Medium"
+            if parent_issue:
+                # Сохраняем информацию о созданной родительской задаче
+                parent_key = parent_issue.key
+                created_issues.append({
+                    'key': parent_key,
+                    'summary': parent_summary,
+                    'assignee': "Unassigned",
+                    'priority': priority
+                })
 
-        # Use email if available, otherwise use name
-        assignee = (task.get('employee_email') or '').strip()
-        if not assignee:
-            logger.warning(f"No email for employee: {task.get('employee')}, using name instead")
-            assignee = task.get('employee')
+                # Создаем подзадачи для каждого исполнителя
+                for task in task_group:
+                    subtask_summary = f"{task_name} - {task['position']}"
+                    subtask_description = format_task_description(task)
 
-        # Create the issue
-        parent_key = parent_tasks.get(task['name'])
-        issue = client.create_issue(
-            project_key=JIRA_PROJECT_KEY,
-            summary=summary,
-            description=description,
-            assignee=assignee,
-            due_date=task.get('end_date'),
-            priority=priority,
-            parent_key=parent_key
-        )
+                    # Приоритет подзадачи
+                    subtask_priority = "High" if task['is_critical'] else "Medium"
 
-        if issue:
-            jira_issues[task['id']] = issue.key
-            created_issues.append({
-                'key': issue.key,
-                'summary': summary,
-                'assignee': assignee,
-                'priority': priority
-            })
+                    # Назначаем исполнителя
+                    assignee = (task.get('employee_email') or '').strip()
+                    if not assignee:
+                        assignee = task.get('employee', '')
 
-    # Create dependencies (but in the correct direction)
+                    # Создаем подзадачу
+                    subtask_issue = client.create_issue(
+                        project_key=JIRA_PROJECT_KEY,
+                        summary=subtask_summary,
+                        description=subtask_description,
+                        assignee=assignee,
+                        due_date=task.get('end_date'),
+                        priority=subtask_priority,
+                        parent_key=parent_key
+                    )
+
+                    if subtask_issue:
+                        jira_issues[task['id']] = subtask_issue.key
+                        created_issues.append({
+                            'key': subtask_issue.key,
+                            'summary': subtask_summary,
+                            'assignee': assignee,
+                            'priority': subtask_priority
+                        })
+        else:
+            # Стандартная обработка обычной задачи (один исполнитель)
+            task = task_group[0]
+            summary = task['name']
+            description = format_task_description(task)
+
+            # Приоритет
+            priority = "High" if task['is_critical'] else "Medium"
+
+            # Назначаем исполнителя
+            assignee = (task.get('employee_email') or '').strip()
+            if not assignee:
+                assignee = task.get('employee', '')
+
+            # Создаем задачу
+            issue = client.create_issue(
+                project_key=JIRA_PROJECT_KEY,
+                summary=summary,
+                description=description,
+                assignee=assignee,
+                due_date=task.get('end_date'),
+                priority=priority
+            )
+
+            if issue:
+                jira_issues[task['id']] = issue.key
+                created_issues.append({
+                    'key': issue.key,
+                    'summary': summary,
+                    'assignee': assignee,
+                    'priority': priority
+                })
+
+    # Создаем зависимости
     create_task_dependencies(client, tasks, jira_issues)
 
     return created_issues
 
 
-def format_task_description(task):
+def format_parent_task_description(task_group):
+    """
+    Форматирует описание родительской задачи.
+
+    Args:
+        task_group: Группа задач с одинаковым названием, но разными исполнителями
+
+    Returns:
+        Форматированное описание для родительской задачи
+    """
+    # Составляем информацию о задаче
+    total_duration = sum(task['duration'] for task in task_group)
+    earliest_start = min(task['start_date'] for task in task_group)
+    latest_finish = max(task['end_date'] for task in task_group)
+
+    # Собираем информацию о должностях
+    positions = [task['position'] for task in task_group]
+    positions_str = ", ".join(positions)
+
+    # Определяем статус критичности
+    is_critical = any(task['is_critical'] for task in task_group)
+    critical_status = "Да" if is_critical else "Нет"
+
+    # Форматируем описание в Markdown для Jira
+    description = f"""
+h2. Информация о составной задаче
+
+* *Общая длительность*: {total_duration} дней
+* *Начало*: {earliest_start.strftime('%d.%m.%Y')}
+* *Окончание*: {latest_finish.strftime('%d.%m.%Y')}
+* *Требуемые должности*: {positions_str}
+* *Критическая задача*: {critical_status}
+
+h2. Описание задачи
+
+Эта задача разделена на подзадачи для специалистов разных должностей. 
+Общее число исполнителей: {len(task_group)}.
+
+h2. Внимание
+
+Эта задача является частью автоматически сгенерированного календарного плана.
+Изменение сроков выполнения критических задач может привести к задержке всего проекта.
+"""
+    return description
+
+
+def get_task_category(position):
+    """
+    Определяет категорию задачи на основе должности исполнителя.
+
+    Args:
+        position: Должность исполнителя задачи
+
+    Returns:
+        Категория задачи (ПМы, Настройка, Контент)
+    """
+    if not position:
+        return None
+
+    position_lower = position.lower()
+
+    # Прямое совпадение
+    if position_lower in POSITION_CATEGORY_MAP:
+        return POSITION_CATEGORY_MAP[position_lower]
+
+    # Частичное совпадение
+    for pos, category in POSITION_CATEGORY_MAP.items():
+        if pos in position_lower:
+            return category
+
+    # Определение по ключевым словам
+    if any(keyword in position_lower for keyword in ["менеджер", "manager", "пм"]):
+        return CATEGORY_PMS
+    elif any(keyword in position_lower for keyword in ["настройк", "технич", "setup"]):
+        return CATEGORY_SETUP
+    elif any(keyword in position_lower for keyword in ["контент", "content", "специалист"]):
+        return CATEGORY_CONTENT
+
+    # По умолчанию возвращаем None, если категория не определена
+    return None
+
+
+def find_project_manager(calendar_plan):
+    """
+    Finds a project manager in the calendar plan.
+
+    Args:
+        calendar_plan: Calendar plan with tasks and employees
+
+    Returns:
+        Dictionary with project manager info or empty dict if not found
+    """
+    # Try to find project manager in tasks
+    for task in calendar_plan.get('tasks', []):
+        position = task.get('position', '').lower()
+        if 'менеджер' in position or 'manager' in position:
+            return {
+                'name': task.get('employee', 'Проектный менеджер'),
+                'email': task.get('employee_email', '')
+            }
+
+    # If not found in tasks, return default
+    return {
+        'name': 'Проектный менеджер',
+        'email': ''
+    }
+
+
+def format_task_description(task, subtitle=None):
     """
     Форматирует описание задачи для Jira.
 
     Args:
         task: Задача из календарного плана
+        subtitle: Подзаголовок (необязательно)
 
     Returns:
         Отформатированное описание задачи
@@ -104,16 +283,26 @@ def format_task_description(task):
     # Определяем статус критической задачи
     critical_status = "Да" if task['is_critical'] else "Нет"
 
+    # Определяем категорию задачи
+    category = get_task_category(task.get('position', ''))
+    category_text = f"* *Категория*: {category}\n" if category else ""
+
     # Форматируем описание в Markdown
     description = f"""
 h2. Информация о задаче
+"""
 
+    if subtitle:
+        description += f"\nh3. {subtitle}\n"
+
+    description += f"""
 * *Длительность*: {task['duration']} дней
 * *Начало*: {task['start_date'].strftime('%d.%m.%Y')}
 * *Окончание*: {task['end_date'].strftime('%d.%m.%Y')}
-* *Исполнитель*: {task['employee']}
-* *Критическая задача*: {critical_status}
-* *Резерв времени*: {task['reserve']} дней
+* *Исполнитель*: {task.get('employee', 'Не назначено')}
+* *Должность*: {task.get('position', 'Не указано')}
+{category_text}* *Критическая задача*: {critical_status}
+* *Резерв времени*: {task.get('reserve', 0)} дней
 
 h2. Внимание
 
@@ -159,16 +348,30 @@ def create_task_dependencies(client, tasks, jira_issues):
     # Create dependencies
     for task in tasks:
         task_id = task['id']
+
+        # Skip if this task doesn't have a Jira issue
+        if task_id not in jira_issues:
+            continue
+
         predecessors = task_predecessors.get(task_id, [])
 
         for predecessor_id in predecessors:
-            if predecessor_id in jira_issues and task_id in jira_issues:
-                # IMPORTANT: This is the fix - make sure dependencies are created in the right direction
-                # A depends on B means B blocks A
-                # So if task depends on predecessor, then predecessor blocks task
+            # For multi-assignee tasks, use the parent issue for dependencies
+            predecessor_key = jira_issues.get(f"{predecessor_id}_parent",
+                                          jira_issues.get(predecessor_id))
+
+            task_key = jira_issues.get(f"{task_id}_parent",
+                                   jira_issues.get(task_id))
+
+            if predecessor_key and task_key:
+                # If task depends on predecessor, then predecessor blocks task
+                # In Jira terms, the predecessor is the "outward" issue (blocks)
+                # and the dependent task is the "inward" issue (is blocked by)
                 client.create_dependency(
-                    issue_key=jira_issues[task_id],  # Dependent issue (blocked by)
-                    depends_on_key=jira_issues[predecessor_id],  # Blocking issue (blocks)
+                    issue_key=task_key,                # Dependent task (inward - is blocked by)
+                    depends_on_key=predecessor_key,    # Predecessor task (outward - blocks)
                     link_type=dependency_link_type
                 )
-                logger.info(f"Created dependency: {jira_issues[task_id]} depends on {jira_issues[predecessor_id]}")
+                logger.info(f"Created dependency: {task_key} depends on {predecessor_key}")
+            else:
+                logger.warning(f"Could not create dependency: Missing Jira issue for task {task_id} or predecessor {predecessor_id}")
