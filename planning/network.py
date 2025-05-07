@@ -59,6 +59,7 @@ def create_network_model(tasks):
             'duration': task['duration'],
             'position': task['position'],
             'predecessors': task.get('predecessors', []),
+            'required_employees': task.get('required_employees', 1),  # <--- добавьте эту строку
             'early_start': 0,
             'early_finish': 0,
             'late_start': 0,

@@ -495,8 +495,8 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             task_name_map[predecessor_name]
                         )
 
-        # Вместо ручного ввода — сразу запускаем процесс выбора сотрудников
-        return await add_employees(update, context)
+        await update.message.reply_text(f"Проект '{project_name}' успешно создан из CSV!")
+        return BotStates.SHOW_PROJECT  
 
     else:
         # Обычное создание проекта
@@ -533,7 +533,7 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Добавляем задачу в БД
     project_id = context.user_data['current_project_id']
-    task_id = add_project_task(project_id, task_name, duration, position)
+    task_id = add_project_task(project_id, task_name, duration, position, required_employees=1)
 
     # Сохраняем задачу в контексте
     if 'tasks' not in context.user_data:
@@ -961,28 +961,37 @@ async def export_to_jira(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик экспорта задач в Jira."""
     query = update.callback_query
     await query.answer()
-
+    
     await safe_edit_message_text(query, "Экспортирую задачи в Jira...")
 
     # Получаем данные календарного плана
     calendar_plan = context.user_data['calendar_plan']
-    # Получаем индивидуальные описания задач
+    for t in calendar_plan['tasks']:
+        print(t['name'], t.get('is_subtask'), t.get('employee'), t.get('required_employees'))
+    
+    # Get individual task descriptions
     task_descriptions = context.user_data.get('task_descriptions', {})
+    
+    # Add task descriptions to the calendar plan
+    calendar_plan['task_descriptions'] = task_descriptions
 
-    # Создаем задачи в Jira, используя индивидуальные описания
-    jira_issues = create_jira_issues(calendar_plan, task_descriptions=task_descriptions)
+    try:
+        # Создаем задачи в Jira
+        jira_issues = create_jira_issues(calendar_plan)
 
-    # Формируем отчет о созданных задачах
-    issues_report = "Созданы следующие задачи в Jira:\n\n"
-    for issue in jira_issues:
-        issues_report += f"- {issue['key']}: {issue['summary']} ({issue['assignee']})\n"
+        # Формируем отчет о созданных задачах
+        issues_report = "Созданы следующие задачи в Jira:\n\n"
+        for issue in jira_issues:
+            issues_report += f"- {issue['key']}: {issue['summary']} ({issue['assignee']})\n"
 
-    await query.message.reply_text(
-        EXPORT_TO_JIRA_SUCCESS + "\n\n" + issues_report,
-        reply_markup=main_menu_keyboard()
-    )
-
-    return BotStates.MAIN_MENU
+        await query.message.reply_text(
+            EXPORT_TO_JIRA_SUCCESS + "\n\n" + issues_report
+        )
+    except Exception as e:
+        logger.error(f"Произошла ошибка: {str(e)}")
+        await query.message.reply_text(
+            "Произошла ошибка при экспорте задач в Jira. Пожалуйста, попробуйте позже."
+        )
 
 
 async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1646,85 +1655,128 @@ async def back_to_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BotStates.SHOW_PLAN
 
 async def preview_before_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает распределение задач по сотрудникам и позволяет редактировать описание каждой задачи перед экспортом в Jira."""
+    """Shows distribution of tasks by employees and allows editing descriptions before Jira export."""
     query = update.callback_query
     await query.answer()
 
-    # Получаем календарный план
+    # Get calendar plan
     calendar_plan = context.user_data.get('calendar_plan')
     if not calendar_plan:
         await query.edit_message_text(
-            "Ошибка: календарный план не найден. Сначала рассчитайте план.",
+            "Error: calendar plan not found. Calculate plan first.",
             reply_markup=plan_actions_keyboard()
         )
         return BotStates.SHOW_PLAN
 
-    # Получаем индивидуальные описания (если есть)
-    task_descriptions = context.user_data.get('task_descriptions', {})
-
-    # Группируем задачи по имени для отображения групповых задач
-    tasks_by_name = {}
+    # Initialize task_descriptions if it doesn't exist
+    if 'task_descriptions' not in context.user_data:
+        context.user_data['task_descriptions'] = {}
+    
+    task_descriptions = context.user_data['task_descriptions']
+    
+    # Group tasks by parent_task_id or by name for tasks with multiple required employees
+    parent_tasks = {}
+    standalone_tasks = []
+    
     for task in calendar_plan['tasks']:
-        name = task['name']
-        if name not in tasks_by_name:
-            tasks_by_name[name] = []
-        tasks_by_name[name].append(task)
-
-    # Формируем сообщение
-    message = "*Распределение задач по сотрудникам:*\n"
-    for task_name, task_group in tasks_by_name.items():
-        required_employees = task_group[0].get('required_employees', 1)
-        
-        if required_employees > 1:
-            message += f"\n*{task_name}* (Групповая задача, требуется {required_employees} исполнителей)\n"
-            for task in task_group:
-                message += f"   - Исполнитель: {task['employee']}\n"
-                message += f"   - Даты: {task['start_date'].strftime('%d.%m.%Y')} — {task['end_date'].strftime('%d.%m.%Y')}\n"
-                desc = task_descriptions.get(str(task['id']), "(нет описания)")
-                message += f"   - Описание: {desc}\n"
+        if task.get('required_employees', 1) > 1:
+            parent_id = task.get('parent_task_id', f"name_{task['name']}")
+            if parent_id not in parent_tasks:
+                parent_tasks[parent_id] = {
+                    'name': task['name'],
+                    'subtasks': []
+                }
+            parent_tasks[parent_id]['subtasks'].append(task)
         else:
-            task = task_group[0]
-            message += f"\n*{task['name']}*\n"
-            message += f"   - Даты: {task['start_date'].strftime('%d.%m.%Y')} — {task['end_date'].strftime('%d.%m.%Y')}\n"
-            message += f"   - Исполнитель: {task['employee']}\n"
-            desc = task_descriptions.get(str(task['id']), "(нет описания)")
-            message += f"   - Описание: {desc}\n"
-
-    # Клавиатура: для каждой задачи — кнопка "Изменить описание"
+            standalone_tasks.append(task)
+    
+    # Format message with proper grouping
+    message = "*Распределение задач по сотрудникам:*\n\n"
+    
+    # First add group tasks
+    for parent_id, parent_data in parent_tasks.items():
+        task_name = parent_data['name']
+        subtasks = parent_data['subtasks']
+        
+        message += f"*{task_name}* (Групповая задача, исполнителей: {len(subtasks)})\n"
+        
+        for subtask in subtasks:
+            message += f"   - Исполнитель: {subtask['employee']}\n"
+            message += f"   - Даты: {subtask['start_date'].strftime('%d.%m.%Y')} — {subtask['end_date'].strftime('%d.%m.%Y')}\n"
+            task_id_str = str(subtask['id'])
+            desc = task_descriptions.get(task_id_str, "(нет описания)")
+            message += f"   - Описание: {desc}\n\n"
+    
+    # Then add standalone tasks
+    for task in standalone_tasks:
+        message += f"*{task['name']}*\n"
+        message += f"   - Даты: {task['start_date'].strftime('%d.%m.%Y')} — {task['end_date'].strftime('%d.%m.%Y')}\n"
+        message += f"   - Исполнитель: {task['employee']}\n"
+        task_id_str = str(task['id'])
+        desc = task_descriptions.get(task_id_str, "(нет описания)")
+        message += f"   - Описание: {desc}\n\n"
+    
+    # Create keyboard buttons
     keyboard = []
-    for task in calendar_plan['tasks']:
+    
+    # Add buttons for group tasks
+    for parent_id, parent_data in parent_tasks.items():
+        for subtask in parent_data['subtasks']:
+            keyboard.append([
+                InlineKeyboardButton(f"Изменить описание: {subtask['name']} | {subtask['employee']}", 
+                                     callback_data=f"edit_desc_{subtask['id']}")
+            ])
+    
+    # Add buttons for standalone tasks
+    for task in standalone_tasks:
         keyboard.append([
-            InlineKeyboardButton(f"Изменить описание: {task['name']}", callback_data=f"edit_desc_{task['id']}")
+            InlineKeyboardButton(f"Изменить описание: {task['name']}", 
+                                 callback_data=f"edit_desc_{task['id']}")
         ])
+    
     keyboard.append([InlineKeyboardButton("Экспорт в Jira", callback_data="export_jira")])
     keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_plan")])
-
+    
     await query.edit_message_text(
         message,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
+    
     return BotStates.PREVIEW_BEFORE_EXPORT
 
 async def edit_task_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик для ввода/редактирования описания задачи перед экспортом в Jira."""
     query = update.callback_query
     await query.answer()
 
-    # Получаем ID задачи из callback_data
-    task_id = int(query.data.replace('edit_desc_', ''))
-    context.user_data['edit_desc_task_id'] = task_id
-
-    await query.edit_message_text(
-        f"Введите новое описание для задачи (или оставьте пустым для удаления описания):",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Отмена", callback_data="cancel_edit_desc")]
-        ])
-    )
-    return BotStates.PREVIEW_BEFORE_EXPORT
+    try:
+        # Get task ID from callback_data
+        task_id = int(query.data.replace('edit_desc_', ''))
+        context.user_data['edit_desc_task_id'] = task_id
+        
+        await query.edit_message_text(
+            f"Enter new description for task (or leave empty to remove description):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Cancel", callback_data="cancel_edit_desc")]
+            ])
+        )
+        return BotStates.PREVIEW_BEFORE_EXPORT
+    except ValueError:
+        logger.error(f"Invalid task ID in callback data: {query.data}")
+        await query.edit_message_text(
+            "Error processing task ID. Please try again.",
+            reply_markup=plan_actions_keyboard()
+        )
+        return BotStates.SHOW_PLAN
 
 async def save_task_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет описание задачи и возвращает к предпросмотру."""
+    # Не вызываем .answer() у None
+    if update.callback_query:
+        await update.callback_query.answer()
+        # Можно добавить обработку callback, если потребуется
+        return
+    # Обработка текстового сообщения
     task_id = context.user_data.get('edit_desc_task_id')
     if not task_id:
         await update.message.reply_text("Ошибка: не выбрана задача для редактирования.")
@@ -1742,14 +1794,3 @@ async def save_task_description(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Описание сохранено.")
     # Возвращаем предпросмотр
     return await preview_before_export(update, context)
-
-def plan_actions_keyboard():
-    """Клавиатура действий с планом."""
-    keyboard = [
-        [InlineKeyboardButton("Посмотреть информацию о проекте", callback_data="show_project_info")],
-        [InlineKeyboardButton("Предпросмотр распределения задач", callback_data="preview_before_export")],
-        [InlineKeyboardButton("Экспорт в Jira", callback_data="export_jira")],
-        [InlineKeyboardButton("Назад", callback_data="back_to_employees")],
-        [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)

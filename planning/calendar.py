@@ -4,6 +4,8 @@
 """
 
 from datetime import datetime, timedelta
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_calendar_plan(network_parameters, project_data, start_date=None):
@@ -25,8 +27,8 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     critical_path = network_parameters['critical_path']
 
     # Debug log: Print task count from the network
-    print(f"Tasks in network: {len(network)}")
-    print(f"Using project start date: {start_date.strftime('%d.%m.%Y')}")
+    logger.debug(f"Tasks in network: {len(network)}")
+    logger.debug(f"Using project start date: {start_date.strftime('%d.%m.%Y')}")
 
     # Convert day names to numerical values
     days_off_map = {
@@ -62,18 +64,12 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     # Create calendar tasks
     for task in optimized_network:
         required_employees = task.get('required_employees', 1)
-        
+        position = task['position']
+        available_employees = position_employee_map.get(position, [])
         if required_employees > 1:
-            # Для задач с несколькими исполнителями создаем копии для каждого исполнителя
-            position = task['position']
-            available_employees = position_employee_map.get(position, [])
-            
             if len(available_employees) >= required_employees:
-                # Выбираем нужное количество сотрудников
                 selected_employees = available_employees[:required_employees]
-                
                 for employee in selected_employees:
-                    # Calculate task dates considering days off
                     task_start_date, task_end_date = calculate_task_dates(
                         task,
                         employee['id'],
@@ -81,17 +77,13 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                         start_date,
                         employee_schedule
                     )
-
-                    # Add task to employee schedule
                     employee_schedule[employee['id']].append({
-                        'task_id': f"{task['id']}_{employee['id']}",  # Уникальный ID для каждой копии
+                        'task_id': f"{task['id']}_{employee['id']}",
                         'start_date': task_start_date,
                         'end_date': task_end_date
                     })
-
-                    # Add task to calendar plan
                     calendar_plan['tasks'].append({
-                        'id': f"{task['id']}_{employee['id']}",  # Уникальный ID для каждой копии
+                        'id': f"{task['id']}_{employee['id']}",
                         'name': task['name'],
                         'start_date': task_start_date,
                         'end_date': task_end_date,
@@ -102,23 +94,54 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                         'employee_email': employee.get('email'),
                         'predecessors': task.get('predecessors', []),
                         'required_employees': required_employees,
-                        'position': position
+                        'position': position,
+                        'is_subtask': True
                     })
             else:
-                # Если не хватает сотрудников, создаем одну задачу без исполнителя
-                calendar_plan['tasks'].append({
-                    'id': task['id'],
-                    'name': task['name'],
-                    'start_date': start_date + timedelta(days=task['early_start']),
-                    'end_date': start_date + timedelta(days=task['early_start'] + task['duration']),
-                    'duration': task['duration'],
-                    'is_critical': task['is_critical'],
-                    'reserve': task['reserve'],
-                    'employee': "Unassigned",
-                    'predecessors': task.get('predecessors', []),
-                    'required_employees': required_employees,
-                    'position': position
-                })
+                for employee in available_employees:
+                    task_start_date, task_end_date = calculate_task_dates(
+                        task,
+                        employee['id'],
+                        days_off_map[employee['id']],
+                        start_date,
+                        employee_schedule
+                    )
+                    employee_schedule[employee['id']].append({
+                        'task_id': f"{task['id']}_{employee['id']}",
+                        'start_date': task_start_date,
+                        'end_date': task_end_date
+                    })
+                    calendar_plan['tasks'].append({
+                        'id': f"{task['id']}_{employee['id']}",
+                        'name': task['name'],
+                        'start_date': task_start_date,
+                        'end_date': task_end_date,
+                        'duration': task['duration'],
+                        'is_critical': task['is_critical'],
+                        'reserve': task['reserve'],
+                        'employee': employee['name'],
+                        'employee_email': employee.get('email'),
+                        'predecessors': task.get('predecessors', []),
+                        'required_employees': required_employees,
+                        'position': position,
+                        'is_subtask': True
+                    })
+                if len(available_employees) < required_employees:
+                    calendar_plan['tasks'].append({
+                        'id': task['id'],
+                        'name': task['name'],
+                        'start_date': start_date + timedelta(days=task['early_start']),
+                        'end_date': start_date + timedelta(days=task['early_start'] + task['duration']),
+                        'duration': task['duration'],
+                        'is_critical': task['is_critical'],
+                        'reserve': task['reserve'],
+                        'employee': "Unassigned",
+                        'employee_email': None,
+                        'predecessors': task.get('predecessors', []),
+                        'required_employees': required_employees,
+                        'position': position,
+                        'is_subtask': True
+                    })
         else:
             # Стандартная обработка для задач с одним исполнителем
             employee_id = task.get('assigned_employee_id')

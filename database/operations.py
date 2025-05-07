@@ -43,7 +43,7 @@ def create_new_project(name):
         session.close()
 
 
-def add_project_task(project_id, name, duration, position):
+def add_project_task(project_id, name, duration, position, required_employees=1):
     """
     Добавляет задачу в проект.
 
@@ -52,6 +52,8 @@ def add_project_task(project_id, name, duration, position):
         name: Название задачи
         duration: Длительность задачи в днях
         position: Должность исполнителя
+        required_employees: Количество сотрудников (по умолчанию 1)
+
 
     Returns:
         ID созданной задачи
@@ -62,7 +64,9 @@ def add_project_task(project_id, name, duration, position):
             project_id=project_id,
             name=name,
             duration=duration,
-            position=position
+            position=position,
+            required_employees=required_employees
+
         )
         session.add(task)
         session.commit()
@@ -187,8 +191,7 @@ def get_project_data(project_id):
     Returns:
         Project data dictionary
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         project = session.query(Project).filter(Project.id == project_id).first()
 
         if not project:
@@ -209,7 +212,8 @@ def get_project_data(project_id):
                 'name': task.name,
                 'duration': task.duration,
                 'position': task.position,
-                'predecessors': predecessor_ids
+                'predecessors': predecessor_ids,
+                'required_employees': task.required_employees
             })
 
         # Get project employees
@@ -234,8 +238,6 @@ def get_project_data(project_id):
             'tasks': tasks_data,
             'employees': employees_data
         }
-    finally:
-        session.close()
 
 
 def create_project_template(name, description=None):
@@ -249,14 +251,11 @@ def create_project_template(name, description=None):
     Returns:
         ID созданного шаблона
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         template = ProjectTemplate(name=name, description=description)
         session.add(template)
         session.commit()
         return template.id
-    finally:
-        session.close()
 
 
 def add_task_template(template_id, name, duration, position, order=0,required_employees=1):
@@ -274,8 +273,7 @@ def add_task_template(template_id, name, duration, position, order=0,required_em
     Returns:
         ID созданного шаблона задачи
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         task = TaskTemplate(
             template_id=template_id,
             name=name,
@@ -287,8 +285,6 @@ def add_task_template(template_id, name, duration, position, order=0,required_em
         session.add(task)
         session.commit()
         return task.id
-    finally:
-        session.close()
 
 
 def add_task_template_dependency(task_id, predecessor_id):
@@ -302,8 +298,7 @@ def add_task_template_dependency(task_id, predecessor_id):
     Returns:
         ID созданной зависимости
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         dependency = TaskTemplateDependency(
             task_id=task_id,
             predecessor_id=predecessor_id
@@ -311,8 +306,6 @@ def add_task_template_dependency(task_id, predecessor_id):
         session.add(dependency)
         session.commit()
         return dependency.id
-    finally:
-        session.close()
 
 
 def get_project_templates():
@@ -322,8 +315,7 @@ def get_project_templates():
     Returns:
         Список шаблонов проектов
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         templates = session.query(ProjectTemplate).all()
         result = []
 
@@ -335,8 +327,6 @@ def get_project_templates():
             })
 
         return result
-    finally:
-        session.close()
 
 
 def get_template_tasks(template_id):
@@ -349,8 +339,7 @@ def get_template_tasks(template_id):
     Returns:
         Список задач шаблона
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         tasks = session.query(TaskTemplate).filter(TaskTemplate.template_id == template_id).order_by(
             TaskTemplate.order).all()
         result = []
@@ -370,8 +359,6 @@ def get_template_tasks(template_id):
             })
 
         return result
-    finally:
-        session.close()
 
 
 def create_project_from_template(template_id, project_name):
@@ -385,8 +372,7 @@ def create_project_from_template(template_id, project_name):
     Returns:
         ID of the created project
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         # Create a new project
         project = Project(name=project_name)
         session.add(project)
@@ -432,8 +418,6 @@ def create_project_from_template(template_id, project_name):
 
         session.commit()
         return project.id
-    finally:
-        session.close()
 
 
 def get_user_projects(user_id=None):
@@ -446,8 +430,7 @@ def get_user_projects(user_id=None):
     Returns:
         Список проектов в формате [{'id': id, 'name': name, 'created_at': date, 'tasks_count': count}]
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         query = session.query(Project)
 
         # Если будет добавлена привязка к пользователю, можно раскомментировать
@@ -472,11 +455,6 @@ def get_user_projects(user_id=None):
             })
 
         return result
-    except Exception as e:
-        logger.error(f"Error retrieving projects: {str(e)}")
-        return []
-    finally:
-        session.close()
 
 
 def is_user_allowed(telegram_id):
@@ -489,12 +467,9 @@ def is_user_allowed(telegram_id):
     Returns:
         bool: True, если пользователь имеет доступ, иначе False
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         user = session.query(AllowedUser).filter(AllowedUser.telegram_id == telegram_id).first()
         return user is not None
-    finally:
-        session.close()
 
 
 def add_allowed_user(telegram_id, name=None, added_by=None, is_admin=False):
@@ -510,8 +485,7 @@ def add_allowed_user(telegram_id, name=None, added_by=None, is_admin=False):
     Returns:
         bool: True, если пользователь успешно добавлен, иначе False
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         # Проверяем, не добавлен ли пользователь уже
         existing = session.query(AllowedUser).filter(AllowedUser.telegram_id == telegram_id).first()
         if existing:
@@ -526,12 +500,6 @@ def add_allowed_user(telegram_id, name=None, added_by=None, is_admin=False):
         session.add(user)
         session.commit()
         return True
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Ошибка при добавлении пользователя: {str(e)}")
-        return False
-    finally:
-        session.close()
 
 
 def get_allowed_users():
@@ -541,8 +509,7 @@ def get_allowed_users():
     Returns:
         List[dict]: Список словарей с данными пользователей
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         users = session.query(AllowedUser).all()
         result = []
 
@@ -556,8 +523,6 @@ def get_allowed_users():
             })
 
         return result
-    finally:
-        session.close()
 
 
 def remove_allowed_user(telegram_id):
@@ -589,12 +554,9 @@ def get_all_positions():
     Returns:
         List[str]: Список уникальных должностей
     """
-    session = Session()
-    try:
+    with session_scope() as session:
         positions = session.query(Employee.position).distinct().all()
         return [position[0] for position in positions]
-    finally:
-        session.close()
 
 
 @contextmanager

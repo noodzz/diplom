@@ -181,49 +181,6 @@ def draw_time_scale(draw, start_date, duration, margin_left, margin_top, day_wid
     # Add column header for tasks only (no employee column)
     draw.text((10, margin_top - 20), "Задача", fill='black', font=font)
 
-def draw_time_scale(draw, start_date, duration, margin_left, margin_top, day_width, image_height, font):
-    """
-    Рисует шкалу времени и сетку для диаграммы Ганта.
-
-    Args:
-        draw: Объект ImageDraw
-        start_date: Начальная дата проекта
-        duration: Продолжительность проекта в днях
-        margin_left: Отступ слева
-        margin_top: Отступ сверху
-        day_width: Ширина одного дня
-        image_height: Высота изображения
-        font: Шрифт для текста
-    """
-    # Рисуем горизонтальные линии сетки
-    for y in range(margin_top, image_height, 30):
-        draw.line([(0, y), (margin_left + duration * day_width, y)], fill='lightgray')
-
-    # Рисуем вертикальные линии сетки и метки дат
-    for i in range(duration + 1):
-        date = start_date + timedelta(days=i)
-        x = margin_left + i * day_width
-
-        # Вертикальная линия
-        draw.line([(x, margin_top - 20), (x, image_height)], fill='lightgray')
-
-        # Метка даты - отображаем только каждый второй день для экономии места
-        if i % 2 == 0:
-            date_text = date.strftime('%d.%m')
-            draw.text((x - 15, margin_top - 20), date_text, fill='black', font=font)
-
-        # Выделяем выходные дни (суббота и воскресенье)
-        if date.weekday() >= 5:  # 5 - суббота, 6 - воскресенье
-            draw.rectangle(
-                [(x, margin_top), (x + day_width, image_height)],
-                fill='#f0f0f0',
-                outline=None
-            )
-
-    # Добавляем метки для заголовков столбцов
-    draw.text((10, margin_top - 20), "Задача", fill='black', font=font)
-    draw.text((margin_left - 150, margin_top - 20), "Исполнитель", fill='black', font=font)
-
 
 def draw_task(draw, task, index, start_date, margin_left, margin_top, day_width, task_height, colors, font, small_font):
     """

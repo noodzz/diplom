@@ -38,7 +38,7 @@ def create_jira_issues(calendar_plan):
     Creates Jira issues based on calendar plan.
 
     Args:
-        calendar_plan: Calendar plan with tasks
+        calendar_plan: Calendar plan with tasks and task descriptions
 
     Returns:
         List of created issues
@@ -53,6 +53,9 @@ def create_jira_issues(calendar_plan):
     jira_issues = {}
     created_issues = []
 
+    # Get task descriptions from the calendar_plan if they exist
+    task_descriptions = calendar_plan.get('task_descriptions', {})
+
     # Группируем задачи по имени
     tasks_by_name = {}
     for task in tasks:
@@ -61,29 +64,22 @@ def create_jira_issues(calendar_plan):
             tasks_by_name[name] = []
         tasks_by_name[name].append(task)
 
-    # Обрабатываем каждую группу задач
     for task_name, task_group in tasks_by_name.items():
-        # Проверяем, требуется ли несколько исполнителей
-        required_employees = task_group[0].get('required_employees', 1)
-        
-        if required_employees > 1:
-            # Создаем родительскую задачу
+        # Проверяем, есть ли в группе подзадачи
+        subtasks = [t for t in task_group if t.get('is_subtask')]
+        if len(subtasks) > 1:
+            # Создаём родительскую задачу без исполнителя
             parent_summary = f"{task_name} (Групповая задача)"
-            parent_description = f"Родительская задача для {task_name}. Требуется {required_employees} исполнителей."
-            
-            # Приоритет родительской задачи
-            priority = "High" if any(task.get('is_critical', False) for task in task_group) else "Medium"
-            
-            # Создаем родительскую задачу
+            parent_description = f"Родительская задача для {task_name}. Требуется {len(subtasks)} исполнителей."
+            priority = "High" if any(t.get('is_critical', False) for t in subtasks) else "Medium"
             parent_issue = client.create_issue(
                 project_key=JIRA_PROJECT_KEY,
                 summary=parent_summary,
                 description=parent_description,
-                priority=priority
+                priority=priority,
+                issue_type="Task"
             )
-
             if parent_issue:
-                # Сохраняем информацию о созданной родительской задаче
                 parent_key = parent_issue.key
                 created_issues.append({
                     'key': parent_key,
@@ -91,63 +87,60 @@ def create_jira_issues(calendar_plan):
                     'assignee': "Unassigned",
                     'priority': priority
                 })
-
-                # Создаем подзадачи для каждого исполнителя
-                for task in task_group:
-                    subtask_summary = f"{task_name} | {task['employee']}"
-                    subtask_description = format_task_description(task)
-
-                    # Приоритет подзадачи
-                    subtask_priority = "High" if task['is_critical'] else "Medium"
-
-                    # Назначаем исполнителя
-                    assignee = (task.get('employee_email') or '').strip()
+                for subtask in subtasks:
+                    subtask_summary = f"{task_name} | {subtask['employee']}"
+                    task_id = str(subtask.get('id', ''))
+                    task_description = task_descriptions.get(task_id, '')
+                    if not task_description:
+                        task_description = format_task_description(subtask)
+                    subtask_priority = "High" if subtask.get('is_critical', False) else "Medium"
+                    assignee = subtask.get('employee_email')
                     if not assignee:
-                        assignee = task.get('employee', '')
-
-                    # Создаем подзадачу
+                        assignee = subtask.get('employee')
+                    if not assignee:
+                        assignee = "Unassigned"
                     subtask_issue = client.create_issue(
                         project_key=JIRA_PROJECT_KEY,
                         summary=subtask_summary,
-                        description=subtask_description,
+                        description=task_description,
                         assignee=assignee,
-                        due_date=task.get('end_date'),
+                        due_date=subtask.get('end_date'),
                         priority=subtask_priority,
-                        parent_key=parent_key
+                        parent_key=parent_key,
+                        issue_type="Sub-task"
                     )
-
                     if subtask_issue:
-                        jira_issues[task['id']] = subtask_issue.key
+                        jira_issues[subtask['id']] = subtask_issue.key
                         created_issues.append({
                             'key': subtask_issue.key,
                             'summary': subtask_summary,
                             'assignee': assignee,
                             'priority': subtask_priority
                         })
+                jira_issues[f"parent_{task_name}"] = parent_key
         else:
-            # Стандартная обработка обычной задачи (один исполнитель)
+            # Обычная задача (Task)
             task = task_group[0]
             summary = task['name']
-            description = format_task_description(task)
-
-            # Приоритет
-            priority = "High" if task['is_critical'] else "Medium"
-
-            # Назначаем исполнителя
-            assignee = (task.get('employee_email') or '').strip()
+            task_id = str(task.get('id', ''))
+            task_description = task_descriptions.get(task_id, '')
+            if not task_description:
+                task_description = format_task_description(task)
+            priority = "High" if task.get('is_critical', False) else "Medium"
+            assignee = task.get('employee_email')
             if not assignee:
-                assignee = task.get('employee', '')
-
-            # Создаем задачу
+                assignee = task.get('employee')
+            if not assignee:
+                assignee = "Unassigned"
             issue = client.create_issue(
                 project_key=JIRA_PROJECT_KEY,
                 summary=summary,
-                description=description,
+                description=task_description,
                 assignee=assignee,
                 due_date=task.get('end_date'),
-                priority=priority
+                priority=priority,
+                issue_type="Task"
             )
-
             if issue:
                 jira_issues[task['id']] = issue.key
                 created_issues.append({
@@ -157,7 +150,7 @@ def create_jira_issues(calendar_plan):
                     'priority': priority
                 })
 
-    # Создаем зависимости
+    # Create dependencies between tasks
     create_task_dependencies(client, tasks, jira_issues)
 
     return created_issues
@@ -382,11 +375,11 @@ def create_task_dependencies(client, tasks, jira_issues):
                         if predecessor_parent_key:
                             # Создаем зависимость между родительскими задачами
                             client.create_dependency(
-                                issue_key=parent_key,                # Dependent task (inward - is blocked by)
-                                depends_on_key=predecessor_parent_key,    # Predecessor task (outward - blocks)
+                                issue_key=predecessor_parent_key,                # blocks
+                                depends_on_key=parent_key,    # is blocked by
                                 link_type=dependency_link_type
                             )
-                            logger.info(f"Created dependency between group tasks: {parent_key} depends on {predecessor_parent_key}")
+                            logger.info(f"Created dependency between group tasks: {predecessor_parent_key} blocks {parent_key}")
         else:
             # Стандартная обработка для обычных задач
             task = task_group[0]
@@ -414,12 +407,12 @@ def create_task_dependencies(client, tasks, jira_issues):
                         break
                 
                 if predecessor_key and task_id in jira_issues:
-                    # Создаем зависимость
+                    # Создаем зависимость: predecessor_key blocks jira_issues[task_id]
                     client.create_dependency(
-                        issue_key=jira_issues[task_id],                # Dependent task (inward - is blocked by)
-                        depends_on_key=predecessor_key,    # Predecessor task (outward - blocks)
+                        issue_key=predecessor_key,                # blocks
+                        depends_on_key=jira_issues[task_id],    # is blocked by
                         link_type=dependency_link_type
                     )
-                    logger.info(f"Created dependency: {jira_issues[task_id]} depends on {predecessor_key}")
+                    logger.info(f"Created dependency: {predecessor_key} blocks {jira_issues[task_id]}")
                 else:
                     logger.warning(f"Could not create dependency: Missing Jira issue for task {task_id} or predecessor {predecessor_id}")
