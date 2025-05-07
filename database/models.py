@@ -42,6 +42,7 @@ class Task(Base):
         back_populates="task"
     )
     subtasks = relationship("Task", backref=backref("parent", remote_side=[id]))  # Связь с подзадачами
+    parts = relationship("TaskPart", back_populates="task")  # Связь с частями задачи
 
     def __repr__(self):
         return f"<Task(id={self.id}, name='{self.name}', duration={self.duration})>"

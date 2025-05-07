@@ -19,10 +19,10 @@ def parse_csv_tasks(csv_data):
     Парсит CSV-файл с задачами.
 
     Формат CSV:
-    name,duration,position,predecessors,required_employees,assignee_roles
+    name,duration,position,predecessors,required_employees,roles_info
 
-    Где assignee_roles - опциональное JSON-поле с описанием ролей и их продолжительностей:
-    [{"position":"Технический специалист","duration":1},{"position":"Старший технический специалист","duration":2}]
+    Где roles_info - строка с описанием ролей и их продолжительностей в формате:
+    "Технический специалист:1|Старший технический специалист:2"
 
     Args:
         csv_data: Содержимое CSV-файла
@@ -56,14 +56,16 @@ def parse_csv_tasks(csv_data):
                 if 'required_employees' in row and row['required_employees']:
                     required_employees = int(row['required_employees'])
 
-                # Проверяем наличие поля assignee_roles и пытаемся его распарсить
+                # Проверяем наличие поля roles_info и пытаемся его распарсить
                 assignee_roles = []
-                if 'assignee_roles' in row and row['assignee_roles']:
-                    try:
-                        assignee_roles = json.loads(row['assignee_roles'])
-                    except json.JSONDecodeError:
-                        logger.error(f"Некорректный JSON в поле assignee_roles для задачи: {row['name']}")
-                        return []
+                if 'roles_info' in row and row['roles_info']:
+                    for role_part in row['roles_info'].split('|'):
+                        if ':' in role_part:
+                            position, role_duration = role_part.split(':')
+                            assignee_roles.append({
+                                "position": position.strip(),
+                                "duration": int(role_duration.strip())
+                            })
 
                 # Определяем, имеет ли задача несколько исполнителей с разными ролями
                 has_multiple_roles = len(assignee_roles) > 0
@@ -138,6 +140,10 @@ def validate_csv_format(csv_content):
         if not first_row:
             return False, "CSV-файл не содержит данных"
 
+        # Проверяем, есть ли поле roles_info, если есть assignee_roles
+        if 'assignee_roles' in header and 'roles_info' not in header:
+            return False, "Обнаружено устаревшее поле 'assignee_roles'. Используйте 'roles_info' с форматом 'Должность:длительность|Должность:длительность'"
+
         return True, "CSV-файл корректен"
 
     except Exception as e:
@@ -202,6 +208,17 @@ def create_project_from_csv(project_name, csv_data):
                     )
                     session.add(subtask)
                     session.flush()
+                    
+                    # Также создаем соответствующую запись в TaskPart
+                    task_part = TaskPart(
+                        task_id=parent_task.id,
+                        name=subtask_name,
+                        position=role['position'],
+                        duration=role['duration'],
+                        order=i+1,
+                        required_employees=1
+                    )
+                    session.add(task_part)
 
                     # Добавляем зависимость от предыдущей подзадачи, если она есть
                     if i > 0:
@@ -259,7 +276,7 @@ def generate_sample_csv():
     Returns:
         Строка с примером CSV
     """
-    sample_data = """name,duration,position,predecessors,required_employees,assignee_roles
+    sample_data = """name,duration,position,predecessors,required_employees,roles_info
 Расчёт стоимостей,3,Проектный менеджер,,1,
 Создание тарифов обучения,1,Технический специалист,Расчёт стоимостей,1,
 Создание продуктовых типов и продуктов,2,Старший тех. специалист,Создание тарифов обучения,2,
@@ -267,7 +284,7 @@ def generate_sample_csv():
 Создание тарифов для внешнего сайта,1,Старший тех. специалист,Создание тарифов обучения,1,
 Создание модулей обучения,2,Руководитель контента,,2,
 Настройка связей между потоками и модулями,1,Старший специалист,"Создание потоков обучения,Создание модулей обучения",1,
-Создание и настройка интерфейса,3,,"Создание тарифов обучения",1,"[{""position"":""Технический специалист"",""duration"":1},{""position"":""Старший технический специалист"",""duration"":2}]"
+Создание и настройка интерфейса,3,,"Создание тарифов обучения",1,Технический специалист:1|Старший технический специалист:2
 """
     return sample_data
 

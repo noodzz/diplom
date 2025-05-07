@@ -63,15 +63,17 @@ def create_jira_issues(calendar_plan):
 
     # Обрабатываем каждую группу задач
     for task_name, task_group in tasks_by_name.items():
-        # Если у задачи несколько исполнителей с разными должностями
-        if len(task_group) > 1:
+        # Проверяем, требуется ли несколько исполнителей
+        required_employees = task_group[0].get('required_employees', 1)
+        
+        if required_employees > 1:
             # Создаем родительскую задачу
-            parent_summary = task_name
-            parent_description = format_parent_task_description(task_group)
-
-            # Определяем приоритет по наличию критических подзадач
-            priority = "High" if any(task['is_critical'] for task in task_group) else "Medium"
-
+            parent_summary = f"{task_name} (Групповая задача)"
+            parent_description = f"Родительская задача для {task_name}. Требуется {required_employees} исполнителей."
+            
+            # Приоритет родительской задачи
+            priority = "High" if any(task.get('is_critical', False) for task in task_group) else "Medium"
+            
             # Создаем родительскую задачу
             parent_issue = client.create_issue(
                 project_key=JIRA_PROJECT_KEY,
@@ -92,7 +94,7 @@ def create_jira_issues(calendar_plan):
 
                 # Создаем подзадачи для каждого исполнителя
                 for task in task_group:
-                    subtask_summary = f"{task_name} - {task['position']}"
+                    subtask_summary = f"{task_name} | {task['employee']}"
                     subtask_description = format_task_description(task)
 
                     # Приоритет подзадачи
@@ -338,40 +340,86 @@ def create_task_dependencies(client, tasks, jira_issues):
         logger.warning("No link types available in Jira, dependencies will not be created")
         return
 
-    # Build a dictionary of task IDs to predecessor IDs for easier lookup
-    task_predecessors = {}
+    # Группируем задачи по имени для обработки групповых задач
+    tasks_by_name = {}
     for task in tasks:
-        task_id = task['id']
-        predecessors = task.get('predecessors', [])
-        task_predecessors[task_id] = predecessors
+        name = task['name']
+        if name not in tasks_by_name:
+            tasks_by_name[name] = []
+        tasks_by_name[name].append(task)
 
-    # Create dependencies
-    for task in tasks:
-        task_id = task['id']
-
-        # Skip if this task doesn't have a Jira issue
-        if task_id not in jira_issues:
-            continue
-
-        predecessors = task_predecessors.get(task_id, [])
-
-        for predecessor_id in predecessors:
-            # For multi-assignee tasks, use the parent issue for dependencies
-            predecessor_key = jira_issues.get(f"{predecessor_id}_parent",
-                                          jira_issues.get(predecessor_id))
-
-            task_key = jira_issues.get(f"{task_id}_parent",
-                                   jira_issues.get(task_id))
-
-            if predecessor_key and task_key:
-                # If task depends on predecessor, then predecessor blocks task
-                # In Jira terms, the predecessor is the "outward" issue (blocks)
-                # and the dependent task is the "inward" issue (is blocked by)
-                client.create_dependency(
-                    issue_key=task_key,                # Dependent task (inward - is blocked by)
-                    depends_on_key=predecessor_key,    # Predecessor task (outward - blocks)
-                    link_type=dependency_link_type
-                )
-                logger.info(f"Created dependency: {task_key} depends on {predecessor_key}")
-            else:
-                logger.warning(f"Could not create dependency: Missing Jira issue for task {task_id} or predecessor {predecessor_id}")
+    # Создаем зависимости
+    for task_name, task_group in tasks_by_name.items():
+        required_employees = task_group[0].get('required_employees', 1)
+        
+        # Получаем ID родительской задачи для групповых задач
+        if required_employees > 1:
+            # Находим родительскую задачу по имени
+            parent_key = None
+            for issue_key, issue in jira_issues.items():
+                if issue['summary'] == f"{task_name} (Групповая задача)":
+                    parent_key = issue_key
+                    break
+            
+            if parent_key:
+                # Для каждой подзадачи создаем зависимости
+                for task in task_group:
+                    task_id = task['id']
+                    predecessors = task.get('predecessors', [])
+                    
+                    for predecessor_id in predecessors:
+                        # Находим родительскую задачу предшественника
+                        predecessor_parent_key = None
+                        for pred_task in tasks:
+                            if pred_task['id'] == predecessor_id:
+                                pred_name = pred_task['name']
+                                for issue_key, issue in jira_issues.items():
+                                    if issue['summary'] == f"{pred_name} (Групповая задача)":
+                                        predecessor_parent_key = issue_key
+                                        break
+                                break
+                        
+                        if predecessor_parent_key:
+                            # Создаем зависимость между родительскими задачами
+                            client.create_dependency(
+                                issue_key=parent_key,                # Dependent task (inward - is blocked by)
+                                depends_on_key=predecessor_parent_key,    # Predecessor task (outward - blocks)
+                                link_type=dependency_link_type
+                            )
+                            logger.info(f"Created dependency between group tasks: {parent_key} depends on {predecessor_parent_key}")
+        else:
+            # Стандартная обработка для обычных задач
+            task = task_group[0]
+            task_id = task['id']
+            predecessors = task.get('predecessors', [])
+            
+            for predecessor_id in predecessors:
+                # Находим задачу предшественника
+                predecessor_key = None
+                for pred_task in tasks:
+                    if pred_task['id'] == predecessor_id:
+                        pred_name = pred_task['name']
+                        pred_required_employees = pred_task.get('required_employees', 1)
+                        
+                        if pred_required_employees > 1:
+                            # Если предшественник - групповая задача, используем родительскую задачу
+                            for issue_key, issue in jira_issues.items():
+                                if issue['summary'] == f"{pred_name} (Групповая задача)":
+                                    predecessor_key = issue_key
+                                    break
+                        else:
+                            # Если предшественник - обычная задача
+                            predecessor_key = jira_issues.get(predecessor_id)
+                        
+                        break
+                
+                if predecessor_key and task_id in jira_issues:
+                    # Создаем зависимость
+                    client.create_dependency(
+                        issue_key=jira_issues[task_id],                # Dependent task (inward - is blocked by)
+                        depends_on_key=predecessor_key,    # Predecessor task (outward - blocks)
+                        link_type=dependency_link_type
+                    )
+                    logger.info(f"Created dependency: {jira_issues[task_id]} depends on {predecessor_key}")
+                else:
+                    logger.warning(f"Could not create dependency: Missing Jira issue for task {task_id} or predecessor {predecessor_id}")

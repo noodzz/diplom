@@ -14,7 +14,13 @@ Session = sessionmaker(bind=engine)
 
 def init_db():
     """Инициализирует базу данных."""
-    Base.metadata.create_all(engine)
+    logger.info(f"Инициализация базы данных с URL: {DATABASE_URL}")
+    try:
+        Base.metadata.create_all(engine)
+        logger.info("База данных успешно инициализирована")
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации базы данных: {str(e)}")
+        raise
 
 
 def create_new_project(name):
@@ -127,12 +133,12 @@ def add_project_employee(project_id, name, position, days_off, email=None):
         session.close()
 
 
-def get_employees_by_position(project_id, position=None):
+def get_employees_by_position(project_id=None, position=None):
     """
-    Получает список сотрудников проекта по должности.
+    Получает список сотрудников по должности.
 
     Args:
-        project_id: ID проекта
+        project_id: ID проекта (необязательно)
         position: Должность сотрудников (необязательно)
 
     Returns:
@@ -140,8 +146,14 @@ def get_employees_by_position(project_id, position=None):
     """
     session = Session()
     try:
-        query = session.query(Employee).filter(Employee.project_id == project_id)
+        # Базовый запрос
+        query = session.query(Employee)
 
+        # Если указан project_id, фильтруем по проекту
+        if project_id:
+            query = query.filter(Employee.project_id == project_id)
+
+        # Если указана должность, фильтруем по ней
         if position:
             query = query.filter(Employee.position == position)
 
@@ -156,7 +168,7 @@ def get_employees_by_position(project_id, position=None):
                 'id': employee.id,
                 'name': employee.name,
                 'position': employee.position,
-                'email': employee.email,  # Добавляем email в результат
+                'email': employee.email,
                 'days_off': days_off_list
             })
 
@@ -568,6 +580,22 @@ def remove_allowed_user(telegram_id):
 
         session.delete(user)
         return True
+
+
+def get_all_positions():
+    """
+    Получает список всех уникальных должностей из базы данных.
+
+    Returns:
+        List[str]: Список уникальных должностей
+    """
+    session = Session()
+    try:
+        positions = session.query(Employee.position).distinct().all()
+        return [position[0] for position in positions]
+    finally:
+        session.close()
+
 
 @contextmanager
 def session_scope():
