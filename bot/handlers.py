@@ -688,21 +688,25 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Получаем сотрудников для должности: {position}")
             
             # Получаем всех сотрудников с этой должностью из базы данных
-            project_id = context.user_data.get('current_project_id')
             employees = get_employees_by_position(project_id=project_id, position=position)
             logger.info(f"Найдено сотрудников: {len(employees)}")
             
-            if not employees:
-                logger.warning(f"Сотрудники с должностью '{position}' не найдены в базе данных")
-                await safe_edit_message_text(
-                    query,
-                    f"Сотрудники с должностью '{position}' не найдены в базе данных. Пожалуйста, добавьте сотрудника вручную.",
-                    reply_markup=employees_actions_keyboard()
-                )
-                return BotStates.ADD_EMPLOYEES
-            
             # Сохраняем выбранную должность в контексте
             context.user_data['selected_position'] = position
+            
+            if not employees:
+                logger.warning(f"Сотрудники с должностью '{position}' не найдены в базе данных")
+                # Предлагаем добавить нового сотрудника
+                keyboard = [
+                    [InlineKeyboardButton("Добавить нового сотрудника", callback_data="add_new_employee")],
+                    [InlineKeyboardButton("Назад", callback_data="back_to_positions")]
+                ]
+                await safe_edit_message_text(
+                    query,
+                    f"Сотрудники с должностью '{position}' не найдены в базе данных. Хотите добавить нового сотрудника?",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return BotStates.ADD_EMPLOYEES
             
             # Показываем список сотрудников для выбора
             message = f"Выберите сотрудника на должность '{position}':\n\n"
@@ -717,6 +721,7 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     employee['name'],
                     callback_data=f"select_employee_{employee['id']}"
                 )])
+            keyboard.append([InlineKeyboardButton("Добавить нового сотрудника", callback_data="add_new_employee")])
             keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_positions")])
             
             await safe_edit_message_text(
@@ -725,6 +730,36 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return BotStates.SELECT_EMPLOYEE
+            
+        elif query.data == "add_new_employee":
+            # Запрашиваем имя нового сотрудника
+            position = context.user_data.get('selected_position')
+            await safe_edit_message_text(
+                query,
+                f"Введите имя нового сотрудника на должность '{position}':",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="cancel_add_employee")]])
+            )
+            return BotStates.ADD_EMPLOYEE_NAME
+            
+        elif query.data == "cancel_add_employee":
+            # Возвращаемся к выбору должности
+            positions = context.user_data.get('available_positions', [])
+            await safe_edit_message_text(
+                query,
+                "Выберите должность сотрудника:",
+                reply_markup=position_selection_keyboard(positions)
+            )
+            return BotStates.SELECT_POSITION
+            
+        elif query.data == "back_to_positions":
+            # Возвращаемся к выбору должности
+            positions = context.user_data.get('available_positions', [])
+            await safe_edit_message_text(
+                query,
+                "Выберите должность сотрудника:",
+                reply_markup=position_selection_keyboard(positions)
+            )
+            return BotStates.SELECT_POSITION
             
         elif query.data.startswith('select_employee_'):
             # Получаем ID выбранного сотрудника
@@ -761,8 +796,7 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 existing_employee = session.query(Employee).filter(
                     Employee.project_id == project_id,
                     Employee.name == employee.name,
-                    Employee.position == employee.position,
-                    Employee.email == employee.email
+                    Employee.position == employee.position
                 ).first()
 
                 if existing_employee:
@@ -794,106 +828,65 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=employees_actions_keyboard()
                     )
                     return BotStates.ADD_EMPLOYEES
-                    
                 except Exception as e:
                     logger.error(f"Ошибка при добавлении сотрудника: {str(e)}")
                     await safe_edit_message_text(
                         query,
-                        "Произошла ошибка при добавлении сотрудника. Попробуйте еще раз.",
+                        f"Ошибка при добавлении сотрудника: {str(e)}",
                         reply_markup=employees_actions_keyboard()
                     )
                     return BotStates.ADD_EMPLOYEES
-
             finally:
                 session.close()
-            
-        elif query.data == 'back_to_positions':
-            # Возвращаемся к выбору должности
-            positions = get_all_positions()
-            await safe_edit_message_text(
-                query,
-                "Выберите должность сотрудника:",
-                reply_markup=position_selection_keyboard(positions)
-            )
-            return BotStates.SELECT_POSITION
-            
-        elif query.data == 'next':
-            logger.info("Переход к следующему шагу")
-            # Получаем ID проекта
+
+    # Если пришел текст с именем нового сотрудника
+    elif update.message and update.message.text:
+        # Проверяем, находимся ли мы в состоянии добавления имени сотрудника
+        if context.user_data.get('state') == BotStates.ADD_EMPLOYEE_NAME:
+            name = update.message.text.strip()
+            position = context.user_data.get('selected_position')
             project_id = context.user_data.get('current_project_id')
-            logger.info(f"ID проекта: {project_id}")
-
-            # Загружаем существующих сотрудников
-            existing_employees = get_employees_by_position(project_id)
-            logger.info(f"Найдено сотрудников: {len(existing_employees) if existing_employees else 0}")
-
-            # Если есть существующие сотрудники, показываем их
-            employees_text = ""
-            if existing_employees:
-                employees_text = "Существующие сотрудники:\n"
-                for idx, employee in enumerate(existing_employees):
-                    days_off_str = ", ".join(employee['days_off'])
-                    employees_text += f"{idx + 1}. {employee['name']} | {employee['position']} | {days_off_str}\n"
-
-                # Сохраняем сотрудников в контексте
-                context.user_data['employees'] = existing_employees
-
-                employees_text += "\nВы можете добавить новых сотрудников или перейти к расчету календарного плана.\n\n"
-
-            try:
-                await safe_edit_message_text(
-                    query,
-                    f"{employees_text}Добавьте информацию о сотрудниках.",
+            
+            if not name or not position or not project_id:
+                await update.message.reply_text(
+                    "Ошибка: не все данные доступны. Пожалуйста, попробуйте еще раз.",
                     reply_markup=employees_actions_keyboard()
                 )
-                logger.info("Сообщение успешно обновлено")
-            except Exception as e:
-                logger.error(f"Ошибка при обновлении сообщения: {str(e)}")
-                raise
-
-            return BotStates.ADD_EMPLOYEES
-
-    # Если пришел текст с информацией о сотруднике в старом формате
-    if update.message and update.message.text:
-        employee_data = update.message.text.split('|')
-
-        if len(employee_data) != 3:
-            await update.message.reply_text(
-                f"Неверный формат. Пожалуйста, используйте формат:\n{ADD_EMPLOYEES_PROMPT}"
-            )
-            return BotStates.ADD_EMPLOYEES
-
-        name = employee_data[0].strip()
-        position = employee_data[1].strip()
-        days_off = [day.strip() for day in employee_data[2].split(',')]
-
-        try:
-            # Добавляем сотрудника в БД
-            project_id = context.user_data['current_project_id']
-            employee_id = add_project_employee(project_id, name, position, days_off)
-
-            # Сохраняем сотрудника в контексте
-            if 'employees' not in context.user_data:
-                context.user_data['employees'] = []
-            context.user_data['employees'].append({
-                'id': employee_id,
-                'name': name,
-                'position': position,
-                'days_off': days_off
-            })
+                return BotStates.ADD_EMPLOYEES
             
-            await update.message.reply_text(
-                f"Сотрудник '{name}' добавлен. Добавьте еще сотрудника или рассчитайте календарный план.",
-                reply_markup=employees_actions_keyboard()
-            )
-            return BotStates.ADD_EMPLOYEES
-        except Exception as e:
-            logger.error(f"Ошибка при добавлении сотрудника в БД: {str(e)}")
-            await update.message.reply_text(
-                "Произошла ошибка при добавлении сотрудника. Попробуйте еще раз.",
-                reply_markup=employees_actions_keyboard()
-            )
-            return BotStates.ADD_EMPLOYEES
+            try:
+                # Добавляем нового сотрудника в проект
+                employee_id = add_project_employee(
+                    project_id=project_id,
+                    name=name,
+                    position=position,
+                    days_off=[]  # По умолчанию без выходных
+                )
+                
+                # Обновляем список сотрудников в контексте
+                if 'employees' not in context.user_data:
+                    context.user_data['employees'] = []
+                context.user_data['employees'].append({
+                    'id': employee_id,
+                    'name': name,
+                    'position': position,
+                    'days_off': []
+                })
+                
+                await update.message.reply_text(
+                    f"Сотрудник '{name}' успешно добавлен на должность '{position}'!",
+                    reply_markup=employees_actions_keyboard()
+                )
+                return BotStates.ADD_EMPLOYEES
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении нового сотрудника: {str(e)}")
+                await update.message.reply_text(
+                    f"Ошибка при добавлении сотрудника: {str(e)}",
+                    reply_markup=employees_actions_keyboard()
+                )
+                return BotStates.ADD_EMPLOYEES
+
+    return BotStates.ADD_EMPLOYEES
 
 
 async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):

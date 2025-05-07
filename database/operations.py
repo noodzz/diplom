@@ -7,6 +7,35 @@ from database.models import Base, Project, Task, TaskDependency, Employee, DayOf
 from config import DATABASE_URL
 from logger import logger
 
+def fuzzy_position_match(db_position, search_position):
+    """Нечеткое сопоставление должностей"""
+    if not db_position or not search_position:
+        return False
+        
+    db_position_lower = db_position.lower().strip()
+    search_position_lower = search_position.lower().strip()
+    
+    # Точное соответствие
+    if db_position_lower == search_position_lower:
+        return True
+        
+    # Стандартизация некоторых должностей
+    variations = {
+        "старший технический специалист": ["старший тех. специалист", "ст. тех. специалист", "старший тех специалист", "ст. технический специалист"],
+        "технический специалист": ["тех. специалист", "тех специалист"],
+        "руководитель настройки": ["руководитель сектора настройки"],
+    }
+    
+    # Проверяем вариации
+    for standard, variants in variations.items():
+        if search_position_lower == standard:
+            return db_position_lower in variants or any(v in db_position_lower for v in variants)
+        elif db_position_lower == standard:
+            return search_position_lower in variants or any(v in search_position_lower for v in variants)
+    
+    # Проверяем частичное соответствие
+    return search_position_lower in db_position_lower or db_position_lower in search_position_lower
+
 # Создаем соединение с БД
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
@@ -18,6 +47,75 @@ def init_db():
     try:
         Base.metadata.create_all(engine)
         logger.info("База данных успешно инициализирована")
+        
+        # Проверяем, есть ли базовый проект
+        session = Session()
+        try:
+            base_project = session.query(Project).filter(Project.name == "Базовый проект").first()
+
+            if not base_project:
+                # Создаем базовый проект
+                base_project = Project(name="Базовый проект")
+                session.add(base_project)
+                session.flush()
+
+                # Создаем базовых сотрудников
+                default_employees = [
+                    {
+                        "name": "Иванов Иван Иванович",
+                        "position": "Технический специалист",
+                        "days_off": ["Среда", "Пятница"]
+                    },
+                    {
+                        "name": "Петров Петр Петрович",
+                        "position": "Старший технический специалист",
+                        "days_off": ["Суббота", "Воскресенье"]
+                    },
+                    {
+                        "name": "Сидоров Сидор Сидорович",
+                        "position": "Руководитель настройки",
+                        "days_off": ["Суббота", "Воскресенье"]
+                    },
+                    {
+                        "name": "Смирнова Анна Ивановна",
+                        "position": "Младший специалист",
+                        "days_off": ["Суббота", "Воскресенье"]
+                    },
+                    {
+                        "name": "Кузнецов Алексей Петрович",
+                        "position": "Старший специалист",
+                        "days_off": ["Суббота", "Воскресенье"]
+                    },
+                    {
+                        "name": "Соколова Мария Александровна",
+                        "position": "Руководитель контента",
+                        "days_off": ["Суббота", "Воскресенье"]
+                    }
+                ]
+
+                for emp_data in default_employees:
+                    employee = Employee(
+                        project_id=base_project.id,
+                        name=emp_data["name"],
+                        position=emp_data["position"]
+                    )
+                    session.add(employee)
+                    session.flush()
+
+                    for day in emp_data["days_off"]:
+                        day_off = DayOff(
+                            employee_id=employee.id,
+                            day=day
+                        )
+                        session.add(day_off)
+
+                session.commit()
+                logger.info("Базовые данные успешно инициализированы")
+            else:
+                logger.info("Базовые данные уже существуют")
+        finally:
+            session.close()
+            
     except Exception as e:
         logger.error(f"Ошибка при инициализации базы данных: {str(e)}")
         raise
@@ -115,9 +213,10 @@ def add_project_employee(project_id, name, position, days_off, email=None):
     """
     session = Session()
     try:
+        logger.info(f"Попытка добавления сотрудника в проект {project_id}: {name} ({position})")
+        
         # Проверяем, существует ли уже такой сотрудник в проекте
         existing_employee = session.query(Employee).filter(
-            Employee.project_id == project_id,
             Employee.name == name,
             Employee.position == position
         ).first()
@@ -136,6 +235,7 @@ def add_project_employee(project_id, name, position, days_off, email=None):
         )
         session.add(employee)
         session.flush()
+        logger.info(f"Создан новый сотрудник '{name}' с ID {employee.id}")
 
         for day in days_off:
             day_off = DayOff(
@@ -143,53 +243,57 @@ def add_project_employee(project_id, name, position, days_off, email=None):
                 day=day
             )
             session.add(day_off)
+            logger.info(f"Добавлен выходной день {day} для сотрудника {employee.id}")
 
         session.commit()
-        logger.info(f"Создан новый сотрудник '{name}' с ID {employee.id}")
+        logger.info(f"Сотрудник '{name}' успешно добавлен в проект {project_id}")
         return employee.id
+    except Exception as e:
+        logger.error(f"Ошибка при добавлении сотрудника: {str(e)}")
+        session.rollback()
+        raise
     finally:
         session.close()
 
 
 def get_employees_by_position(project_id=None, position=None):
     """
-    Получает список сотрудников по должности.
-
-    Args:
-        project_id: ID проекта (необязательно)
-        position: Должность сотрудников (необязательно)
-
-    Returns:
-        Список сотрудников
+    Получает список сотрудников по должности с нечетким сопоставлением.
     """
     session = Session()
     try:
         # Базовый запрос
         query = session.query(Employee)
 
-        # Если указан project_id, фильтруем по проекту
-        if project_id:
-            query = query.filter(Employee.project_id == project_id)
+        # Отладочный вывод
+        logger.info("Доступные должности в базе данных:")
+        all_positions = session.query(Employee.position).distinct().all()
+        for pos in all_positions:
+            logger.info(f"  - '{pos[0]}'")
+        logger.info(f"Ищем должность: '{position}'")
 
-        # Если указана должность, фильтруем по ней
-        if position:
-            query = query.filter(Employee.position == position)
-
-        employees = query.all()
-
+        # Получаем всех сотрудников
+        all_employees = query.all()
+        logger.info(f"Всего сотрудников в запросе: {len(all_employees)}")
+        
+        # Фильтруем вручную
         result = []
-        for employee in employees:
-            days_off = session.query(DayOff).filter(DayOff.employee_id == employee.id).all()
-            days_off_list = [day.day for day in days_off]
+        for employee in all_employees:
+            # Если должность не указана или есть нечеткое совпадение
+            if not position or fuzzy_position_match(employee.position, position):
+                days_off = session.query(DayOff).filter(DayOff.employee_id == employee.id).all()
+                days_off_list = [day.day for day in days_off]
+                
+                result.append({
+                    'id': employee.id,
+                    'name': employee.name,
+                    'position': employee.position,
+                    'email': employee.email,
+                    'days_off': days_off_list
+                })
+                logger.info(f"Подходящий сотрудник: {employee.name}, должность: '{employee.position}'")
 
-            result.append({
-                'id': employee.id,
-                'name': employee.name,
-                'position': employee.position,
-                'email': employee.email,
-                'days_off': days_off_list
-            })
-
+        logger.info(f"Найдено подходящих сотрудников: {len(result)}")
         return result
     finally:
         session.close()
