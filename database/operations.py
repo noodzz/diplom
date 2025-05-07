@@ -101,7 +101,7 @@ def add_task_dependencies(task_id, predecessor_id):
 
 def add_project_employee(project_id, name, position, days_off, email=None):
     """
-    Adds an employee to a project.
+    Adds an employee to a project, checking for duplicates.
 
     Args:
         project_id: ID of the project
@@ -111,10 +111,23 @@ def add_project_employee(project_id, name, position, days_off, email=None):
         email: Email of the employee (optional)
 
     Returns:
-        ID of the created employee
+        ID of the created employee or existing employee if duplicate
     """
     session = Session()
     try:
+        # Проверяем, существует ли уже такой сотрудник в проекте
+        existing_employee = session.query(Employee).filter(
+            Employee.project_id == project_id,
+            Employee.name == name,
+            Employee.position == position
+        ).first()
+        
+        if existing_employee:
+            # Если сотрудник уже существует, возвращаем его ID
+            logger.info(f"Сотрудник '{name}' уже существует в проекте с ID {existing_employee.id}")
+            return existing_employee.id
+            
+        # Если нет, создаем нового сотрудника
         employee = Employee(
             project_id=project_id,
             name=name,
@@ -132,6 +145,7 @@ def add_project_employee(project_id, name, position, days_off, email=None):
             session.add(day_off)
 
         session.commit()
+        logger.info(f"Создан новый сотрудник '{name}' с ID {employee.id}")
         return employee.id
     finally:
         session.close()

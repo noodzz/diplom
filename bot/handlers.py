@@ -495,8 +495,18 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             task_name_map[predecessor_name]
                         )
 
-        await update.message.reply_text(f"Проект '{project_name}' успешно создан из CSV!")
-        return BotStates.SHOW_PROJECT  
+        keyboard = [
+        [InlineKeyboardButton("Добавить сотрудников", callback_data="add_employees")],
+        [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+        [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
+        ]
+    
+        await update.message.reply_text(
+            f"Проект '{project_name}' успешно создан из CSV! Выберите дальнейшее действие:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        return BotStates.SELECT_PROJECT 
 
     else:
         # Обычное создание проекта
@@ -678,7 +688,8 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"Получаем сотрудников для должности: {position}")
             
             # Получаем всех сотрудников с этой должностью из базы данных
-            employees = get_employees_by_position(position=position)
+            project_id = context.user_data.get('current_project_id')
+            employees = get_employees_by_position(project_id=project_id, position=position)
             logger.info(f"Найдено сотрудников: {len(employees)}")
             
             if not employees:
@@ -745,14 +756,31 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'days_off': days_off_list
                 }
 
-                # Добавляем сотрудника в проект
+                # Проверяем, не добавлен ли уже этот сотрудник в проект
                 project_id = context.user_data.get('current_project_id')
+                existing_employee = session.query(Employee).filter(
+                    Employee.project_id == project_id,
+                    Employee.name == employee.name,
+                    Employee.position == employee.position,
+                    Employee.email == employee.email
+                ).first()
+
+                if existing_employee:
+                    await safe_edit_message_text(
+                        query,
+                        f"Сотрудник '{employee.name}' уже добавлен в проект!",
+                        reply_markup=employees_actions_keyboard()
+                    )
+                    return BotStates.ADD_EMPLOYEES
+
+                # Добавляем сотрудника в проект
                 try:
                     add_project_employee(
                         project_id=project_id,
                         name=employee_data['name'],
                         position=employee_data['position'],
-                        days_off=employee_data['days_off']
+                        days_off=employee_data['days_off'],
+                        email=employee_data['email']
                     )
                     
                     # Обновляем список сотрудников в контексте
@@ -843,7 +871,6 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Добавляем сотрудника в БД
             project_id = context.user_data['current_project_id']
             employee_id = add_project_employee(project_id, name, position, days_off)
-            logger.info(f"Сотрудник успешно добавлен с ID: {employee_id}")
 
             # Сохраняем сотрудника в контексте
             if 'employees' not in context.user_data:
@@ -854,7 +881,7 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'position': position,
                 'days_off': days_off
             })
-
+            
             await update.message.reply_text(
                 f"Сотрудник '{name}' добавлен. Добавьте еще сотрудника или рассчитайте календарный план.",
                 reply_markup=employees_actions_keyboard()

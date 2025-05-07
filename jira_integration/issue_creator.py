@@ -350,7 +350,7 @@ def create_task_dependencies(client, tasks, jira_issues):
             # Находим родительскую задачу по имени
             parent_key = None
             for issue_key, issue in jira_issues.items():
-                if issue['summary'] == f"{task_name} (Групповая задача)":
+                if isinstance(issue, dict) and issue.get('summary') == f"{task_name} (Групповая задача)":
                     parent_key = issue_key
                     break
             
@@ -367,7 +367,7 @@ def create_task_dependencies(client, tasks, jira_issues):
                             if pred_task['id'] == predecessor_id:
                                 pred_name = pred_task['name']
                                 for issue_key, issue in jira_issues.items():
-                                    if issue['summary'] == f"{pred_name} (Групповая задача)":
+                                    if isinstance(issue, dict) and issue.get('summary') == f"{pred_name} (Групповая задача)":
                                         predecessor_parent_key = issue_key
                                         break
                                 break
@@ -397,7 +397,7 @@ def create_task_dependencies(client, tasks, jira_issues):
                         if pred_required_employees > 1:
                             # Если предшественник - групповая задача, используем родительскую задачу
                             for issue_key, issue in jira_issues.items():
-                                if issue['summary'] == f"{pred_name} (Групповая задача)":
+                                if isinstance(issue, dict) and issue.get('summary') == f"{pred_name} (Групповая задача)":
                                     predecessor_key = issue_key
                                     break
                         else:
