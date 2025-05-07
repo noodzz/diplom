@@ -20,7 +20,7 @@ from database.models import AllowedUser, Employee, DayOff, Project, Task, TaskDe
     TaskTemplateDependency
 from database.operations import (
     create_new_project, add_project_task, add_task_dependencies,
-    add_project_employee, get_project_data, get_employees_by_position,
+    add_project_employee, add_employee_to_project, get_project_data, get_employees_by_position,
     get_project_templates, create_project_from_template, get_user_projects, get_allowed_users, add_allowed_user,
     is_user_allowed, session_scope, get_all_positions, Session
 )
@@ -411,12 +411,7 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if base_project and base_project['employees']:
             # Копируем сотрудников из базового проекта в новый проект
             for employee in base_project['employees']:
-                add_project_employee(
-                    project_id=project_id,
-                    name=employee['name'],
-                    position=employee['position'],
-                    days_off=employee['days_off']
-                )
+                add_employee_to_project(employee['id'], project_id)
 
             # Обновляем данные проекта после добавления сотрудников
             project_data = get_project_data(project_id)
@@ -687,9 +682,14 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
             project_id = context.user_data.get('current_project_id')
             logger.info(f"Получаем сотрудников для должности: {position}")
             
-            # Получаем всех сотрудников с этой должностью из базы данных
-            employees = get_employees_by_position(project_id=project_id, position=position)
-            logger.info(f"Найдено сотрудников: {len(employees)}")
+            session = Session()
+            project = session.query(Project).get(project_id)
+            if project:
+                employees = [e for e in project.employees if e.position == position]
+            else:
+                employees = []
+            session.close()
+            logger.info(f"Найдено сотрудников: {len(employees) if employees else 0}")
             
             # Сохраняем выбранную должность в контексте
             context.user_data['selected_position'] = position
@@ -793,13 +793,8 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Проверяем, не добавлен ли уже этот сотрудник в проект
                 project_id = context.user_data.get('current_project_id')
-                existing_employee = session.query(Employee).filter(
-                    Employee.project_id == project_id,
-                    Employee.name == employee.name,
-                    Employee.position == employee.position
-                ).first()
-
-                if existing_employee:
+                project = session.query(Project).get(project_id)
+                if employee in project.employees:
                     await safe_edit_message_text(
                         query,
                         f"Сотрудник '{employee.name}' уже добавлен в проект!",
@@ -809,12 +804,9 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Добавляем сотрудника в проект
                 try:
-                    add_project_employee(
-                        project_id=project_id,
-                        name=employee_data['name'],
-                        position=employee_data['position'],
-                        days_off=employee_data['days_off'],
-                        email=employee_data['email']
+                    add_employee_to_project(
+                        employee_id=employee_data['id'],
+                        project_id=project_id
                     )
                     
                     # Обновляем список сотрудников в контексте
@@ -857,12 +849,12 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 # Добавляем нового сотрудника в проект
                 employee_id = add_project_employee(
-                    project_id=project_id,
                     name=name,
                     position=position,
-                    days_off=[]  # По умолчанию без выходных
+                    days_off=[],
+                    email=None  # если есть
                 )
-                
+                add_employee_to_project(employee_id, project_id)
                 # Обновляем список сотрудников в контексте
                 if 'employees' not in context.user_data:
                     context.user_data['employees'] = []
@@ -1131,7 +1123,10 @@ async def select_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return BotStates.MAIN_MENU
 
         # Загружаем существующих сотрудников
-        existing_employees = get_employees_by_position(project_id)
+        session = Session()
+        project = session.query(Project).get(project_id)
+        existing_employees = project.employees if project else []
+        session.close()
         logger.info(f"Найдено сотрудников: {len(existing_employees) if existing_employees else 0}")
 
         # Формируем сообщение

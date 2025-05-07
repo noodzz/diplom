@@ -95,7 +95,6 @@ def init_db():
 
                 for emp_data in default_employees:
                     employee = Employee(
-                        project_id=base_project.id,
                         name=emp_data["name"],
                         position=emp_data["position"]
                     )
@@ -197,12 +196,11 @@ def add_task_dependencies(task_id, predecessor_id):
         session.close()
 
 
-def add_project_employee(project_id, name, position, days_off, email=None):
+def add_project_employee(name, position, days_off, email=None, project_id=None):
     """
     Adds an employee to a project, checking for duplicates.
 
     Args:
-        project_id: ID of the project
         name: Full name of the employee
         position: Position of the employee
         days_off: List of days off
@@ -213,13 +211,18 @@ def add_project_employee(project_id, name, position, days_off, email=None):
     """
     session = Session()
     try:
-        logger.info(f"Попытка добавления сотрудника в проект {project_id}: {name} ({position})")
-        
+        if project_id:
+            logger.info(f"Попытка добавления сотрудника в проект {project_id}: {name} ({position})")
+        else:
+            logger.info(f"Попытка добавления сотрудника: {name} ({position})")
+            
         # Проверяем, существует ли уже такой сотрудник в проекте
-        existing_employee = session.query(Employee).filter(
+        query = session.query(Employee).filter(
             Employee.name == name,
             Employee.position == position
-        ).first()
+        )
+            
+        existing_employee = query.first()
         
         if existing_employee:
             # Если сотрудник уже существует, возвращаем его ID
@@ -228,7 +231,6 @@ def add_project_employee(project_id, name, position, days_off, email=None):
             
         # Если нет, создаем нового сотрудника
         employee = Employee(
-            project_id=project_id,
             name=name,
             position=position,
             email=email
@@ -246,7 +248,6 @@ def add_project_employee(project_id, name, position, days_off, email=None):
             logger.info(f"Добавлен выходной день {day} для сотрудника {employee.id}")
 
         session.commit()
-        logger.info(f"Сотрудник '{name}' успешно добавлен в проект {project_id}")
         return employee.id
     except Exception as e:
         logger.error(f"Ошибка при добавлении сотрудника: {str(e)}")
@@ -335,7 +336,8 @@ def get_project_data(project_id):
             })
 
         # Get project employees
-        employees = session.query(Employee).filter(Employee.project_id == project_id).all()
+        project = session.query(Project).filter(Project.id == project_id).first()
+        employees = project.employees if project else []        
         employees_data = []
 
         for employee in employees:
@@ -692,5 +694,18 @@ def session_scope():
         session.rollback()
         logger.error(f"Ошибка при работе с БД: {str(e)}")
         raise
+    finally:
+        session.close()
+
+def add_employee_to_project(employee_id, project_id):
+    session = Session()
+    try:
+        employee = session.query(Employee).get(employee_id)
+        project = session.query(Project).get(project_id)
+        if employee and project and employee not in project.employees:
+            project.employees.append(employee)
+            session.commit()
+            return True
+        return False
     finally:
         session.close()

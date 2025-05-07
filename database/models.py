@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, DateTime, Table
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, backref
 from datetime import datetime
@@ -7,6 +7,12 @@ from config import DATABASE_URL
 
 Base = declarative_base()
 
+# Новая таблица для связи сотрудник-проект
+employee_project = Table(
+    'employee_project', Base.metadata,
+    Column('employee_id', Integer, ForeignKey('employees.id'), primary_key=True),
+    Column('project_id', Integer, ForeignKey('projects.id'), primary_key=True)
+)
 
 class Project(Base):
     """Модель проекта в БД."""
@@ -17,7 +23,7 @@ class Project(Base):
     created_at = Column(DateTime, default=datetime.now)
 
     tasks = relationship("Task", back_populates="project")
-    employees = relationship("Employee", back_populates="project")
+    employees = relationship("Employee", secondary=employee_project, back_populates="projects")
 
     def __repr__(self):
         return f"<Project(id={self.id}, name='{self.name}')>"
@@ -67,12 +73,11 @@ class Employee(Base):
     __tablename__ = 'employees'
 
     id = Column(Integer, primary_key=True)
-    project_id = Column(Integer, ForeignKey('projects.id'), nullable=False)
     name = Column(String, nullable=False)
     position = Column(String, nullable=False)
     email = Column(String, nullable=True)
 
-    project = relationship("Project", back_populates="employees")
+    projects = relationship("Project", secondary=employee_project, back_populates="employees")
     days_off = relationship("DayOff", back_populates="employee")
 
     def __repr__(self):
