@@ -26,9 +26,41 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     employees = project_data['employees']
     critical_path = network_parameters['critical_path']
 
-    # Debug log: Print task count from the network
-    logger.debug(f"Tasks in network: {len(network)}")
-    logger.debug(f"Using project start date: {start_date.strftime('%d.%m.%Y')}")
+    # Добавляем подробное логирование
+    logger.info("=== Начало создания календарного плана ===")
+    logger.info(f"Количество задач в сети: {len(network)}")
+    logger.info(f"Количество сотрудников: {len(employees)}")
+    logger.info(f"Дата начала проекта: {start_date.strftime('%d.%m.%Y')}")
+
+    # Логируем информацию о задачах
+    logger.info("\n=== Информация о задачах ===")
+    for task in network:
+        logger.info(f"Задача: {task['name']}")
+        logger.info(f"  - Должность: {task.get('position', 'Не указана')}")
+        logger.info(f"  - Требуется сотрудников: {task.get('required_employees', 1)}")
+        logger.info(f"  - Длительность: {task['duration']} дней")
+
+    # Логируем информацию о сотрудниках
+    logger.info("\n=== Информация о сотрудниках ===")
+    for employee in employees:
+        logger.info(f"Сотрудник: {employee['name']}")
+        logger.info(f"  - Должность: {employee['position']}")
+        logger.info(f"  - Выходные: {', '.join(employee['days_off'])}")
+
+    # Создаем маппинг должностей
+    position_employee_map = {}
+    for employee in employees:
+        position = employee['position']
+        if position not in position_employee_map:
+            position_employee_map[position] = []
+        position_employee_map[position].append(employee)
+
+    # Логируем маппинг должностей
+    logger.info("\n=== Маппинг должностей ===")
+    for position, emps in position_employee_map.items():
+        logger.info(f"Должность '{position}': {len(emps)} сотрудников")
+        for emp in emps:
+            logger.info(f"  - {emp['name']}")
 
     # Convert day names to numerical values
     days_off_map = {
@@ -75,6 +107,10 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     for task in network:
         position = task.get('position', '')
         required_employees = task.get('required_employees', 1)
+        
+        logger.info(f"\nОбработка задачи: {task['name']}")
+        logger.info(f"Требуемая должность: {position}")
+        logger.info(f"Требуется сотрудников: {required_employees}")
         
         # Проверяем, есть ли в позиции несколько должностей
         if '|' in position:
@@ -162,6 +198,8 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                         'position': employee['position'],
                         'is_subtask': True
                     })
+            else:
+                logger.warning(f"Не удалось найти всех необходимых сотрудников для задачи {task['name']}")
         else:
             # Стандартная обработка для задач с одной должностью
             available_employees = position_employee_map.get(position, [])
@@ -224,6 +262,8 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                             'position': position,
                             'is_subtask': True
                         })
+                else:
+                    logger.warning(f"Не удалось найти всех необходимых сотрудников для задачи {task['name']}")
             else:
                 # Для обычных задач (один исполнитель)
                 for employee in available_employees:
@@ -255,6 +295,11 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                         'required_employees': 1,
                         'position': position
                     })
+
+    logger.info("\n=== Итоги создания календарного плана ===")
+    logger.info(f"Создано задач: {len(calendar_plan['tasks'])}")
+    logger.info(f"Критический путь: {', '.join(calendar_plan['critical_path'])}")
+    logger.info(f"Длительность проекта: {calendar_plan['project_duration']} дней")
 
     return calendar_plan
 

@@ -263,24 +263,22 @@ def get_employees_by_position(project_id=None, position=None):
     """
     session = Session()
     try:
-        # Базовый запрос
-        query = session.query(Employee)
-
-        # Отладочный вывод
-        logger.info("Доступные должности в базе данных:")
-        all_positions = session.query(Employee.position).distinct().all()
-        for pos in all_positions:
-            logger.info(f"  - '{pos[0]}'")
-        logger.info(f"Ищем должность: '{position}'")
-
-        # Получаем всех сотрудников
-        all_employees = query.all()
+        # If project_id is provided, get employees from that project
+        if project_id:
+            project = session.query(Project).get(project_id)
+            if project:
+                all_employees = project.employees
+            else:
+                all_employees = []
+        else:
+            # Get all employees if no project is specified
+            all_employees = session.query(Employee).all()
+            
         logger.info(f"Всего сотрудников в запросе: {len(all_employees)}")
         
-        # Фильтруем вручную
+        # Filter by position manually
         result = []
         for employee in all_employees:
-            # Если должность не указана или есть нечеткое совпадение
             if not position or fuzzy_position_match(employee.position, position):
                 days_off = session.query(DayOff).filter(DayOff.employee_id == employee.id).all()
                 days_off_list = [day.day for day in days_off]
@@ -292,9 +290,7 @@ def get_employees_by_position(project_id=None, position=None):
                     'email': employee.email,
                     'days_off': days_off_list
                 })
-                logger.info(f"Подходящий сотрудник: {employee.name}, должность: '{employee.position}'")
-
-        logger.info(f"Найдено подходящих сотрудников: {len(result)}")
+                
         return result
     finally:
         session.close()

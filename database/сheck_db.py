@@ -7,7 +7,7 @@ try:
     print("Сотрудники в базе данных:")
     employees = session.query(Employee).all()
     for emp in employees:
-        print(f"ID: {emp.id}, Имя: {emp.name}, Должность: '{emp.position}', Проект ID: {emp.project_id}")
+        print(f"ID: {emp.id}, Имя: {emp.name}, Должность: '{emp.position}')
     
     print("\nУникальные должности:")
     positions = session.query(Employee.position).distinct().all()
