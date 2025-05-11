@@ -8,6 +8,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def calculate_parent_start_date(parent_task, subtasks, project_start_date):
+    """Вычисляет дату начала родительской задачи на основе дат подзадач."""
+    # Используем ранний старт из сетевой модели
+    return project_start_date + timedelta(days=parent_task.get('early_start', 0))
+
+def calculate_parent_end_date(parent_task, subtasks, project_start_date):
+    """Вычисляет дату окончания родительской задачи на основе дат подзадач."""
+    # Используем ранний финиш из сетевой модели
+    return project_start_date + timedelta(days=parent_task.get('early_finish', 0))
+
+
 def create_calendar_plan(network_parameters, project_data, start_date=None):
     """
     Creates a calendar plan considering employee days off.
@@ -26,41 +37,26 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     employees = project_data['employees']
     critical_path = network_parameters['critical_path']
 
-    # Добавляем подробное логирование
+    # Debug log
     logger.info("=== Начало создания календарного плана ===")
     logger.info(f"Количество задач в сети: {len(network)}")
     logger.info(f"Количество сотрудников: {len(employees)}")
     logger.info(f"Дата начала проекта: {start_date.strftime('%d.%m.%Y')}")
 
-    # Логируем информацию о задачах
+    # Логирование задач
     logger.info("\n=== Информация о задачах ===")
     for task in network:
         logger.info(f"Задача: {task['name']}")
-        logger.info(f"  - Должность: {task.get('position', 'Не указана')}")
+        logger.info(f"  - Должность: {task['position']}")
         logger.info(f"  - Требуется сотрудников: {task.get('required_employees', 1)}")
         logger.info(f"  - Длительность: {task['duration']} дней")
 
-    # Логируем информацию о сотрудниках
+    # Логирование сотрудников
     logger.info("\n=== Информация о сотрудниках ===")
     for employee in employees:
         logger.info(f"Сотрудник: {employee['name']}")
         logger.info(f"  - Должность: {employee['position']}")
         logger.info(f"  - Выходные: {', '.join(employee['days_off'])}")
-
-    # Создаем маппинг должностей
-    position_employee_map = {}
-    for employee in employees:
-        position = employee['position']
-        if position not in position_employee_map:
-            position_employee_map[position] = []
-        position_employee_map[position].append(employee)
-
-    # Логируем маппинг должностей
-    logger.info("\n=== Маппинг должностей ===")
-    for position, emps in position_employee_map.items():
-        logger.info(f"Должность '{position}': {len(emps)} сотрудников")
-        for emp in emps:
-            logger.info(f"  - {emp['name']}")
 
     # Convert day names to numerical values
     days_off_map = {
@@ -76,12 +72,19 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
             position_employee_map[position] = []
         position_employee_map[position].append(employee)
 
+    # Логирование маппинга должностей
+    logger.info("\n=== Маппинг должностей ===")
+    for position, emps in position_employee_map.items():
+        logger.info(f"Должность '{position}': {len(emps)} сотрудников")
+        for emp in emps:
+            logger.info(f"  - {emp['name']}")
+
     # Create flexible position mapping
     flexible_position_map = {}
     for position in position_employee_map.keys():
         position_lower = position.lower()
         flexible_position_map[position_lower] = position
-        
+
         # Добавляем вариации должностей
         if "технический" in position_lower:
             if "старший" in position_lower:
@@ -100,202 +103,172 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
         'project_duration': calculate_project_duration_with_days_off(network, employees, start_date)
     }
 
-    # Track employee schedules
+    # Track employee schedules and workload
     employee_schedule = {employee['id']: [] for employee in employees}
+    employee_workload = {employee['id']: 0 for employee in employees}
+
+    # Идентификация родительских и дочерних задач
+    parent_tasks = {}
+    child_tasks = {}
+
+    for task in network:
+        # Проверяем, является ли задача родительской (имеет пустую должность или required_employees > 1)
+        if not task['position'] or task.get('required_employees', 1) > 1:
+            parent_tasks[task['id']] = task
+
+        # Проверяем, является ли задача дочерней (имеет parent_id)
+        if task.get('parent_id'):
+            if task['parent_id'] not in child_tasks:
+                child_tasks[task['parent_id']] = []
+            child_tasks[task['parent_id']].append(task)
 
     # Process each task
     for task in network:
+        logger.info(f"\nОбработка задачи: {task['name']}")
         position = task.get('position', '')
         required_employees = task.get('required_employees', 1)
-        
-        logger.info(f"\nОбработка задачи: {task['name']}")
+
         logger.info(f"Требуемая должность: {position}")
         logger.info(f"Требуется сотрудников: {required_employees}")
-        
-        # Проверяем, есть ли в позиции несколько должностей
-        if '|' in position:
-            # Разбиваем позиции на отдельные должности
-            positions = [pos.strip() for pos in position.split('|')]
-            required_employees = len(positions)  # Количество требуемых сотрудников = количество должностей
-            
-            logger.info(f"Обработка задачи с несколькими должностями: {task['name']}")
-            logger.info(f"Требуемые должности: {positions}")
-            
-            # Находим общее время, когда все сотрудники доступны
-            common_start_date = None
-            common_end_date = None
-            selected_employees = []
-            
-            # Для каждой должности ищем подходящего сотрудника
-            for pos in positions:
-                pos_lower = pos.lower()
-                matched_position = None
-                
-                # Ищем подходящую должность в гибком маппинге
-                for key, value in flexible_position_map.items():
-                    if key in pos_lower or pos_lower in key:
-                        matched_position = value
-                        break
-                
-                if not matched_position:
-                    logger.warning(f"Не найдено соответствие для должности: {pos}")
-                    continue
-                
-                logger.info(f"Найдено соответствие должности {pos} -> {matched_position}")
-                
-                # Получаем список сотрудников с этой должностью
-                available_employees = position_employee_map.get(matched_position, [])
-                if not available_employees:
-                    logger.warning(f"Нет доступных сотрудников для должности: {matched_position}")
-                    continue
-                
-                logger.info(f"Найдено {len(available_employees)} сотрудников для должности {matched_position}")
-                
-                # Проверяем доступность каждого сотрудника
-                for employee in available_employees:
-                    # Проверяем, не назначен ли уже этот сотрудник на эту задачу
-                    if any(e['id'] == employee['id'] for e in selected_employees):
-                        continue
-                        
-                    task_start_date, task_end_date = calculate_task_dates(
-                        task,
-                        employee['id'],
-                        days_off_map[employee['id']],
-                        start_date,
-                        employee_schedule
-                    )
-                    
-                    if common_start_date is None or task_start_date > common_start_date:
-                        common_start_date = task_start_date
-                    if common_end_date is None or task_end_date < common_end_date:
-                        common_end_date = task_end_date
-                    
-                    selected_employees.append(employee)
-                    break  # Берем первого доступного сотрудника для этой должности
-            
-            # Если нашли всех сотрудников
-            if len(selected_employees) == len(positions):
-                # Создаем задачи для каждого сотрудника в одно и то же время
-                for employee in selected_employees:
-                    employee_schedule[employee['id']].append({
-                        'task_id': f"{task['id']}_{employee['id']}",
-                        'start_date': common_start_date,
-                        'end_date': common_end_date
-                    })
-                    
-                    calendar_plan['tasks'].append({
-                        'id': f"{task['id']}_{employee['id']}",
-                        'name': task['name'],
-                        'start_date': common_start_date,
-                        'end_date': common_end_date,
-                        'duration': task['duration'],
-                        'is_critical': task['is_critical'],
-                        'reserve': task['reserve'],
-                        'employee': employee['name'],
-                        'employee_email': employee.get('email'),
-                        'predecessors': task.get('predecessors', []),
-                        'required_employees': required_employees,
-                        'position': employee['position'],
-                        'is_subtask': True
-                    })
-            else:
-                logger.warning(f"Не удалось найти всех необходимых сотрудников для задачи {task['name']}")
-        else:
-            # Стандартная обработка для задач с одной должностью
+
+        # Пропускаем родительские задачи с пустой должностью
+        if task['id'] in parent_tasks and not position:
+            # Добавляем родительскую задачу без исполнителя
+            earliest_start = task.get('early_start', 0)
+            earliest_finish = task.get('early_finish', 0)
+
+            start_date_task = start_date + timedelta(days=earliest_start)
+            end_date_task = start_date + timedelta(days=earliest_finish)
+
+            calendar_plan['tasks'].append({
+                'id': task['id'],
+                'name': task['name'],
+                'start_date': start_date_task,
+                'end_date': end_date_task,
+                'duration': task['duration'],
+                'is_critical': task['is_critical'],
+                'reserve': task['reserve'],
+                'employee': None,
+                'employee_email': None,
+                'predecessors': task.get('predecessors', []),
+                'required_employees': required_employees,
+                'position': '',
+                'is_parent': True
+            })
+            continue
+
+        # Проверка, является ли задача частью родительской задачи с несколькими ролями
+        if task.get('parent_id') in parent_tasks:
+            # Это подзадача родительской задачи - обрабатываем как обычную задачу
+            pass
+
+        # Проверяем доступных сотрудников для должности
+        available_employees = position_employee_map.get(position, [])
+
+        # Если сотрудников с такой должностью не найдено, пробуем нечеткое сопоставление
+        if not available_employees and position:
+            for pos, pos_value in flexible_position_map.items():
+                if pos in position.lower() or position.lower() in pos:
+                    available_employees = position_employee_map.get(pos_value, [])
+                    logger.info(f"Нечеткое сопоставление: '{position}' -> '{pos_value}'")
+                    break
+
+        # Если не найдены сотрудники для должности, пропускаем задачу
+        if not available_employees:
+            logger.warning(f"Не найдены сотрудники для должности: {position}")
+            continue
+
+        # Для задач, требующих несколько исполнителей
+        # Для задач, требующих несколько исполнителей (внутри функции create_calendar_plan)
+        if required_employees > 1:
+            # Находим доступных сотрудников с подходящей должностью
             available_employees = position_employee_map.get(position, [])
+            if not available_employees and position:
+                # Пробуем нечеткое сопоставление должностей
+                for pos, pos_value in flexible_position_map.items():
+                    if pos in position.lower() or position.lower() in pos:
+                        available_employees = position_employee_map.get(pos_value, [])
+                        logger.info(f"Нечеткое сопоставление: '{position}' -> '{pos_value}'")
+                        break
+
             if not available_employees:
-                logger.warning(f"No employees available for position: {position}")
+                logger.warning(f"Не найдены сотрудники для должности: {position}")
                 continue
 
-            # Для групповых задач (требуется несколько исполнителей)
-            if required_employees > 1:
-                # Находим общее время, когда все сотрудники доступны
-                common_start_date = None
-                common_end_date = None
-                selected_employees = []
-                
-                # Проверяем доступность каждого сотрудника
-                for employee in available_employees:
-                    # Проверяем, не назначен ли уже этот сотрудник на эту задачу
-                    if any(e['id'] == employee['id'] for e in selected_employees):
-                        continue
-                        
-                    task_start_date, task_end_date = calculate_task_dates(
-                        task,
-                        employee['id'],
-                        days_off_map[employee['id']],
-                        start_date,
-                        employee_schedule
-                    )
-                    
-                    if common_start_date is None or task_start_date > common_start_date:
-                        common_start_date = task_start_date
-                    if common_end_date is None or task_end_date < common_end_date:
-                        common_end_date = task_end_date
-                    
-                    selected_employees.append(employee)
-                    if len(selected_employees) == required_employees:
-                        break
-                
-                # Если нашли всех сотрудников
-                if len(selected_employees) == required_employees:
-                    # Создаем задачи для каждого сотрудника в одно и то же время
-                    for employee in selected_employees:
-                        employee_schedule[employee['id']].append({
-                            'task_id': f"{task['id']}_{employee['id']}",
-                            'start_date': common_start_date,
-                            'end_date': common_end_date
-                        })
-                        
-                        calendar_plan['tasks'].append({
-                            'id': f"{task['id']}_{employee['id']}",
-                            'name': task['name'],
-                            'start_date': common_start_date,
-                            'end_date': common_end_date,
-                            'duration': task['duration'],
-                            'is_critical': task['is_critical'],
-                            'reserve': task['reserve'],
-                            'employee': employee['name'],
-                            'employee_email': employee.get('email'),
-                            'predecessors': task.get('predecessors', []),
-                            'required_employees': required_employees,
-                            'position': position,
-                            'is_subtask': True
-                        })
-                else:
-                    logger.warning(f"Не удалось найти всех необходимых сотрудников для задачи {task['name']}")
-            else:
-                # Для обычных задач (один исполнитель)
-                for employee in available_employees:
-                    task_start_date, task_end_date = calculate_task_dates(
-                        task,
-                        employee['id'],
-                        days_off_map[employee['id']],
-                        start_date,
-                        employee_schedule
-                    )
-                    
-                    employee_schedule[employee['id']].append({
-                        'task_id': task['id'],
-                        'start_date': task_start_date,
-                        'end_date': task_end_date
-                    })
-                    
-                    calendar_plan['tasks'].append({
-                        'id': task['id'],
-                        'name': task['name'],
-                        'start_date': task_start_date,
-                        'end_date': task_end_date,
-                        'duration': task['duration'],
-                        'is_critical': task['is_critical'],
-                        'reserve': task['reserve'],
-                        'employee': employee['name'],
-                        'employee_email': employee.get('email'),
-                        'predecessors': task.get('predecessors', []),
-                        'required_employees': 1,
-                        'position': position
-                    })
+            # Сортируем сотрудников по загруженности
+            sorted_employees = sorted(available_employees, key=lambda e: employee_workload.get(e['id'], 0))
 
+            # Выбираем только необходимое количество сотрудников (не больше required_employees)
+            selected_employees = sorted_employees[:min(required_employees, len(sorted_employees))]
+            logger.info(f"Выбрано {len(selected_employees)} из {len(sorted_employees)} доступных сотрудников " +
+                        f"(требуется {required_employees})")
+
+            tasks_for_employees = []
+
+            # Создаем задачи только для выбранных сотрудников
+            for employee in selected_employees:
+                # Вычисляем даты начала и окончания
+                task_start_date, task_end_date = calculate_task_dates(
+                    task,
+                    employee['id'],
+                    days_off_map[employee['id']],
+                    start_date,
+                    employee_schedule
+                )
+
+                # Добавляем к загруженности сотрудника
+                duration_days = (task_end_date - task_start_date).days + 1
+                employee_workload[employee['id']] += duration_days
+
+                # Добавляем в расписание
+                employee_schedule[employee['id']].append({
+                    'task_id': f"{task['id']}_{employee['id']}",
+                    'start_date': task_start_date,
+                    'end_date': task_end_date
+                })
+
+                # Создаем задачу в плане
+                tasks_for_employees.append({
+                    'id': f"{task['id']}_{employee['id']}",
+                    'name': task['name'],
+                    'start_date': task_start_date,
+                    'end_date': task_end_date,
+                    'duration': task['duration'],
+                    'is_critical': task['is_critical'],
+                    'reserve': task['reserve'],
+                    'employee': employee['name'],
+                    'employee_email': employee.get('email'),
+                    'predecessors': task.get('predecessors', []),
+                    'required_employees': 1,  # Для подзадачи всегда 1
+                    'position': position,
+                    'is_subtask': True,
+                    'parent_id': task['id']
+                })
+
+            # Добавляем родительскую задачу
+            earliest_start = min(t['start_date'] for t in tasks_for_employees)
+            latest_end = max(t['end_date'] for t in tasks_for_employees)
+
+            calendar_plan['tasks'].append({
+                'id': task['id'],
+                'name': task['name'],
+                'start_date': earliest_start,
+                'end_date': latest_end,
+                'duration': task['duration'],
+                'is_critical': task['is_critical'],
+                'reserve': task['reserve'],
+                'employee': None,  # Родительская задача не имеет исполнителя
+                'employee_email': None,
+                'predecessors': task.get('predecessors', []),
+                'required_employees': required_employees,
+                'position': position,
+                'is_parent': True
+            })
+
+            # Добавляем подзадачи
+            calendar_plan['tasks'].extend(tasks_for_employees)
+
+    # Логирование итогов
     logger.info("\n=== Итоги создания календарного плана ===")
     logger.info(f"Создано задач: {len(calendar_plan['tasks'])}")
     logger.info(f"Критический путь: {', '.join(calendar_plan['critical_path'])}")

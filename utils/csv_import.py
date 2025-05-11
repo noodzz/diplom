@@ -150,52 +150,45 @@ def validate_csv_format(csv_content):
         return False, f"Ошибка при проверке CSV: {str(e)}"
 
 
-def create_project_from_csv(project_name, csv_data):
+def create_project_from_tasks(project_name, tasks):
     """
-    Создает проект на основе CSV-файла с задачами.
+    Creates a project based on a list of parsed tasks.
 
     Args:
-        project_name: Название нового проекта
-        csv_data: Содержимое CSV-файла
+        project_name: Name of the new project
+        tasks: List of parsed task data
 
     Returns:
-        ID созданного проекта или None в случае ошибки
+        ID of the created project or None on error
     """
-    # Парсим задачи из CSV
-    tasks = parse_csv_tasks(csv_data)
-
-    if not tasks:
-        logger.error("Не удалось распарсить задачи из CSV")
-        return None
-
     session = Session()
     try:
-        # Создаем новый проект
+        # Create new project
         project = Project(name=project_name)
         session.add(project)
         session.flush()
 
-        # Словарь для соответствия названия задачи -> ID созданной задачи
+        # Dictionary to map task name to created task ID
         task_name_map = {}
 
-        # Создаем задачи для проекта
+        # Create tasks for the project
         for task_data in tasks:
-            # Проверяем, имеет ли задача несколько исполнителей с разными ролями
+            # Check if task has multiple roles with different positions
             if task_data.get('has_multiple_roles') and task_data.get('assignee_roles'):
-                # Создаем родительскую задачу
+                # Create parent task
                 parent_task = Task(
                     project_id=project.id,
                     name=task_data['name'],
                     duration=task_data['duration'],
-                    position='',  # Родительская задача не имеет конкретной должности
-                    required_employees=1
+                    position='',  # Parent task has no specific position
+                    required_employees=len(task_data['assignee_roles'])
                 )
                 session.add(parent_task)
                 session.flush()
 
                 task_name_map[task_data['name']] = parent_task.id
 
-                # Создаем подзадачи для каждой роли
+                # Create subtasks for each role
                 for i, role in enumerate(task_data['assignee_roles']):
                     subtask_name = f"{task_data['name']} - {role['position']}"
                     subtask = Task(
@@ -208,28 +201,28 @@ def create_project_from_csv(project_name, csv_data):
                     )
                     session.add(subtask)
                     session.flush()
-                    
-                    # Также создаем соответствующую запись в TaskPart
+
+                    # Also create TaskPart record
                     task_part = TaskPart(
                         task_id=parent_task.id,
                         name=subtask_name,
                         position=role['position'],
                         duration=role['duration'],
-                        order=i+1,
+                        order=i + 1,
                         required_employees=1
                     )
                     session.add(task_part)
 
-                    # Добавляем зависимость от предыдущей подзадачи, если она есть
+                    # Add dependency on previous subtask if it exists
                     if i > 0:
-                        prev_subtask_id = subtask.id - 1  # Предыдущая подзадача
+                        prev_subtask_id = subtask.id - 1
                         task_dependency = TaskDependency(
                             task_id=subtask.id,
                             predecessor_id=prev_subtask_id
                         )
                         session.add(task_dependency)
             else:
-                # Обычная задача
+                # Regular task
                 task = Task(
                     project_id=project.id,
                     name=task_data['name'],
@@ -242,7 +235,7 @@ def create_project_from_csv(project_name, csv_data):
 
                 task_name_map[task_data['name']] = task.id
 
-        # Добавляем зависимости между задачами
+        # Add dependencies between tasks
         for task_data in tasks:
             if 'predecessors' in task_data and task_data['predecessors']:
                 task_id = task_name_map.get(task_data['name'])
@@ -257,16 +250,37 @@ def create_project_from_csv(project_name, csv_data):
                             session.add(task_dependency)
 
         session.commit()
-        logger.info(f"Создан проект из CSV: {project_name} (ID: {project.id})")
+        logger.info(f"Created project from tasks: {project_name} (ID: {project.id})")
         return project.id
 
     except Exception as e:
         session.rollback()
-        logger.error(f"Ошибка при создании проекта из CSV: {str(e)}")
+        logger.error(f"Error creating project from tasks: {str(e)}")
         return None
 
     finally:
         session.close()
+
+
+def create_project_from_csv(project_name, csv_data):
+    """
+    Creates a project based on CSV file data.
+
+    Args:
+        project_name: Name of the new project
+        csv_data: CSV file content
+
+    Returns:
+        ID of the created project or None on error
+    """
+    # Parse tasks from CSV
+    tasks = parse_csv_tasks(csv_data)
+
+    if not tasks:
+        logger.error("Failed to parse tasks from CSV")
+        return None
+
+    return create_project_from_tasks(project_name, tasks)
 
 
 def generate_sample_csv():

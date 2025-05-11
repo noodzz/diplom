@@ -11,16 +11,54 @@ def generate_gantt_chart(calendar_plan):
     Returns:
         PIL Image object with the Gantt chart
     """
+    # Проверка на наличие задач
+    if not calendar_plan or 'tasks' not in calendar_plan or not calendar_plan['tasks']:
+        # Создаем пустое изображение с сообщением об ошибке
+        image = Image.new('RGB', (400, 200), 'white')
+        draw = ImageDraw.Draw(image)
+        try:
+            font = ImageFont.truetype('arial.ttf', 12)
+        except IOError:
+            font = ImageFont.load_default()
+        draw.text((10, 10), "Нет задач для отображения", fill="black", font=font)
+        return image
+
+    # Идентификация родительских задач (имеют подзадачи)
+    parent_task_ids = set()
+    for task in calendar_plan['tasks']:
+        if task.get('parent_id'):
+            parent_task_ids.add(task.get('parent_id'))
+
+    # Фильтруем задачи: показываем или родительские, если нет подзадач, или подзадачи
+    filtered_tasks = []
+    for task in calendar_plan['tasks']:
+        task_id = task.get('id')
+        # Если это родительская задача без исполнителя или задача без подзадач
+        if (task_id in parent_task_ids and not task.get('is_subtask')) or (task_id not in parent_task_ids):
+            filtered_tasks.append(task)
+
+    # Используем отфильтрованные задачи вместо всех задач
+    tasks = filtered_tasks
+
+    # Сортируем задачи по дате начала
+    sorted_tasks = sorted(tasks, key=lambda x: x['start_date'])
     # Группируем задачи по имени для отображения групповых задач
     tasks_by_name = {}
     for task in calendar_plan['tasks']:
-        name = task['name']
-        if name not in tasks_by_name:
-            tasks_by_name[name] = []
-        tasks_by_name[name].append(task)
+        # Для подзадач (с is_subtask=True) используем уникальный ключ с сотрудником
+        if task.get('is_subtask'):
+            key = f"{task['name']} - {task.get('employee', 'Не назначен')}"
+            if key not in tasks_by_name:
+                tasks_by_name[key] = []
+            tasks_by_name[key].append(task)
+        else:
+            # Для обычных задач используем только имя
+            name = task['name']
+            if name not in tasks_by_name:
+                tasks_by_name[name] = []
+            tasks_by_name[name].append(task)
 
     # Сортируем задачи по дате начала
-    sorted_tasks = []
     for task_name, task_group in tasks_by_name.items():
         required_employees = task_group[0].get('required_employees', 1)
         if required_employees > 1:
