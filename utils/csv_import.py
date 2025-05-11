@@ -221,6 +221,34 @@ def create_project_from_tasks(project_name, tasks):
                             predecessor_id=prev_subtask_id
                         )
                         session.add(task_dependency)
+            elif task_data.get('required_employees', 1) > 1:
+                # Создаем родительскую задачу
+                parent_task = Task(
+                    project_id=project.id,
+                    name=task_data['name'],
+                    duration=task_data['duration'],
+                    position='',  # Родительская задача без позиции
+                    required_employees=task_data['required_employees']
+                )
+                session.add(parent_task)
+                session.flush()
+
+                task_name_map[task_data['name']] = parent_task.id
+
+                # Создаем подзадачи для каждого исполнителя
+                position = task_data.get('position', '')
+                for i in range(task_data['required_employees']):
+                    subtask_name = f"{task_data['name']} - Исполнитель {i + 1}"
+                    subtask = Task(
+                        project_id=project.id,
+                        name=subtask_name,
+                        duration=task_data['duration'],
+                        position=position,
+                        required_employees=1,
+                        parent_id=parent_task.id
+                    )
+                    session.add(subtask)
+                    session.flush()
             else:
                 # Regular task
                 task = Task(
@@ -250,7 +278,11 @@ def create_project_from_tasks(project_name, tasks):
                             session.add(task_dependency)
 
         session.commit()
+        project_id = project.id
         logger.info(f"Created project from tasks: {project_name} (ID: {project.id})")
+        # Automatically assign employees based on required positions
+        from utils.employee_assignment import auto_assign_employees_to_project
+        auto_assign_employees_to_project(project_id)
         return project.id
 
     except Exception as e:

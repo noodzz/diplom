@@ -406,46 +406,35 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Сохраняем задачи в контексте
         context.user_data['tasks'] = project_data['tasks']
 
-        # Получаем базовый проект с сотрудниками
-        base_project = get_project_data(1)  # Предполагается, что базовый проект имеет ID=1
+        # Автоматически назначаем сотрудников на проект
+        from utils.employee_assignment import auto_assign_employees_to_project  # Импортируем новую функцию
+        assigned_employees = auto_assign_employees_to_project(project_id)
 
-        # Если есть базовый проект и в нем есть сотрудники
-        if base_project and base_project['employees']:
-            # Копируем сотрудников из базового проекта в новый проект
-            for employee in base_project['employees']:
-                add_employee_to_project(employee['id'], project_id)
+        # Обновляем данные проекта после добавления сотрудников
+        project_data = get_project_data(project_id)
 
-            # Обновляем данные проекта после добавления сотрудников
-            project_data = get_project_data(project_id)
+        # Сохраняем сотрудников в контексте
+        context.user_data['employees'] = project_data['employees']
 
-            # Сохраняем сотрудников в контексте
-            context.user_data['employees'] = project_data['employees']
-
-            # Переходим сразу к расчету плана, так как у нас есть все необходимые данные
-            await update.message.reply_text(
-                f"Проект '{project_name}' создан на основе шаблона. Сотрудники автоматически добавлены из базового проекта. Теперь вы можете рассчитать календарный план."
-            )
-
-            # Создаем клавиатуру с действиями для проекта
-            keyboard = [
-                [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
-                [InlineKeyboardButton("Редактировать задачи", callback_data="edit_tasks")],
-                [InlineKeyboardButton("Редактировать сотрудников", callback_data="edit_employees")],
-                [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
-            ]
-
-            await update.message.reply_text(
-                f"Выберите дальнейшие действия:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-
-            return BotStates.ADD_TASK
-
-        # Если нет базового проекта или в нем нет сотрудников, запрашиваем добавление сотрудников
+        # Переходим сразу к расчету плана, так как у нас есть все необходимые данные
         await update.message.reply_text(
-            f"Проект '{project_name}' создан на основе шаблона. Теперь добавьте информацию о сотрудниках.\n\n{ADD_EMPLOYEES_PROMPT}"
+            f"Проект '{project_name}' создан на основе шаблона. Сотрудники автоматически назначены. Теперь вы можете рассчитать календарный план."
         )
-        return BotStates.ADD_EMPLOYEES
+
+        # Создаем клавиатуру с действиями для проекта
+        keyboard = [
+            [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+            [InlineKeyboardButton("Редактировать задачи", callback_data="edit_tasks")],
+            [InlineKeyboardButton("Редактировать сотрудников", callback_data="edit_employees")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
+        ]
+
+        await update.message.reply_text(
+            f"Выберите дальнейшие действия:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        return BotStates.ADD_TASK
 
     elif 'csv_tasks' in context.user_data:
         # Create project from CSV tasks
@@ -464,11 +453,12 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Get project data to update context
         project_data = get_project_data(project_id)
         context.user_data['tasks'] = project_data['tasks']
+        context.user_data['employees'] = project_data['employees']
 
         keyboard = [
-            [InlineKeyboardButton("Add employees", callback_data="add_employees")],
-            [InlineKeyboardButton("Calculate calendar plan", callback_data="calculate")],
-            [InlineKeyboardButton("Return to main menu", callback_data="main_menu")]
+            [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+            [InlineKeyboardButton("Редактировать сотрудников", callback_data="edit_employees")],
+            [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
         ]
 
         await update.message.reply_text(
@@ -1342,92 +1332,191 @@ async def show_project_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Добавляем информацию о критическом пути
     message += "*Критический путь:*\n"
-    if isinstance(calendar_plan['critical_path'], list):
-        if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
-            # Если critical_path - список словарей
-            for task in calendar_plan['critical_path']:
-                message += f"- {task['name']}\n"
-        else:
-            # Если critical_path - список строк
-            for task_name in calendar_plan['critical_path']:
-                message += f"- {task_name}\n"
-    else:
-        message += "Критический путь не определен\n"
+    for task_name in calendar_plan['critical_path']:
+        message += f"- {task_name}\n"
+
+    # Группируем задачи по имени для выявления подзадач
+    tasks_by_name = {}
+    for task in calendar_plan['tasks']:
+        name = task.get('name', '')
+
+        # Убираем суффикс " - Должность" для подзадач
+        base_name = name
+        if ' - ' in name:
+            base_name = name.split(' - ')[0]
+
+        if base_name not in tasks_by_name:
+            tasks_by_name[base_name] = []
+        tasks_by_name[base_name].append(task)
+
+    # Идентифицируем родительские задачи
+    parent_tasks = {}
+    standalone_tasks = []
+
+    for task in calendar_plan['tasks']:
+        if task.get('is_parent') or task.get('required_employees', 1) > 1:
+            parent_tasks[task['id']] = {
+                'task': task,
+                'subtasks': []
+            }
+        elif not task.get('parent_id') and not task.get('is_subtask'):
+            # Проверяем, является ли задача подзадачей (по имени)
+            name = task.get('name', '')
+            if ' - ' in name:
+                # Это подзадача, но parent_id не установлен
+                continue
+            standalone_tasks.append(task)
+
+    # Добавляем подзадачи к родительским задачам
+    for name, tasks in tasks_by_name.items():
+        # Если есть подзадачи (задачи с названием, начинающимся с основного имени)
+        subtasks = [t for t in tasks if t.get('name', '') != name]
+
+        # Находим родительскую задачу
+        parent_task = next((t for t in tasks if t.get('name', '') == name), None)
+
+        if parent_task and parent_task.get('id') in parent_tasks:
+            parent_tasks[parent_task['id']]['subtasks'] = subtasks
 
     # Добавляем информацию о задачах
     message += "\n*Задачи:*\n"
 
-    # Группируем задачи по имени для обработки групповых задач
-    tasks_by_name = {}
-    for task in calendar_plan['tasks']:
-        name = task['name']
-        if name not in tasks_by_name:
-            tasks_by_name[name] = []
-        tasks_by_name[name].append(task)
+    # Приоритет сортировки: критические первыми, затем по раннему старту
+    all_parent_tasks = sorted(
+        parent_tasks.values(),
+        key=lambda x: (not x['task'].get('is_critical', False),
+                       x['task'].get('start_date', datetime.now()))
+    )
 
-    # Определим, какие задачи являются критическими
-    critical_tasks = set()
-    if isinstance(calendar_plan['critical_path'], list):
-        if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
-            critical_tasks = {task['name'] for task in calendar_plan['critical_path']}
+    # Сначала добавляем информацию о родительских задачах
+    for parent_info in all_parent_tasks:
+        parent = parent_info['task']
+        subtasks = parent_info['subtasks']
+
+        required_employees = parent.get('required_employees', 1)
+
+        # Получаем название задачи
+        parent_name = parent.get('name', 'Неизвестная задача')
+
+        message += f"\n*{parent_name}* (Групповая задача"
+        if required_employees > 1:
+            message += f", требуется {required_employees} исполнителей"
+        message += ")\n"
+
+        # Добавляем базовую информацию о родительской задаче даже без подзадач
+        if parent.get('start_date') and parent.get('end_date'):
+            start_date_str = parent['start_date'].strftime('%d.%m.%Y')
+            end_date_str = parent['end_date'].strftime('%d.%m.%Y')
+            message += f"   - Даты: {start_date_str} — {end_date_str}\n"
+
+        if 'duration' in parent:
+            message += f"   - Длительность: {parent['duration']} дней\n"
+
+        if parent.get('is_critical'):
+            message += "   - Критическая задача\n"
+
+        if parent.get('reserve'):
+            message += f"   - Резерв: {parent['reserve']} дней\n"
+
+        # Добавляем информацию о подзадачах если они есть
+        if subtasks:
+            message += "   - Подзадачи:\n"
+
+            for subtask in subtasks:
+                # Выделяем должность из имени подзадачи, если указано
+                subtask_name = subtask.get('name', '')
+                position = ""
+                if ' - ' in subtask_name:
+                    position = subtask_name.split(' - ')[1]
+                    message += f"      - *{position}*:\n"
+                else:
+                    message += f"      - Подзадача:\n"
+
+                # Безопасное получение имени исполнителя
+                employee_name = subtask.get('employee', 'Не назначен')
+                if employee_name is None:
+                    employee_name = 'Не назначен'
+
+                message += f"         Исполнитель: {employee_name}\n"
+
+                # Безопасное форматирование дат
+                if subtask.get('start_date') and subtask.get('end_date'):
+                    start_date_str = subtask['start_date'].strftime('%d.%m.%Y')
+                    end_date_str = subtask['end_date'].strftime('%d.%m.%Y')
+                    message += f"         Даты: {start_date_str} — {end_date_str}\n"
+
+                if 'duration' in subtask:
+                    message += f"         Длительность: {subtask['duration']} дней\n"
+
+                if subtask.get('is_critical'):
+                    message += "         Критическая задача\n"
+
+                if subtask.get('reserve'):
+                    message += f"         Резерв: {subtask['reserve']} дней\n"
         else:
-            critical_tasks = set(calendar_plan['critical_path'])
+            # Если подзадач нет, но задача групповая, показываем сообщение
+            message += "   - Подзадачи не назначены\n"
 
-    # Сначала отображаем критические задачи, затем остальные
-    for is_critical in [True, False]:
-        for task_name, task_group in tasks_by_name.items():
-            # Пропускаем задачи, не соответствующие текущему критерию (критические/некритические)
-            task_is_critical = (task_name in critical_tasks) or any(
-                task.get('is_critical', False) for task in task_group)
-            if task_is_critical != is_critical:
-                continue
+    # Затем добавляем информацию о обычных задачах
+    sorted_standalone = sorted(
+        standalone_tasks,
+        key=lambda x: (not x.get('is_critical', False), x.get('start_date', datetime.now()))
+    )
 
-            required_employees = task_group[0].get('required_employees', 1)
+    for task in sorted_standalone:
+        message += f"\n*{task.get('name', 'Неизвестная задача')}*\n"
 
-            # Формируем заголовок задачи
-            if required_employees > 1:
-                message += f"\n*{task_name}* (Групповая задача, требуется {required_employees} исполнителей)\n"
-            else:
-                message += f"\n*{task_name}*\n"
-                if task_is_critical:
-                    message += "   - *Критическая задача*\n"
+        # Безопасное получение имени исполнителя
+        employee_name = task.get('employee', 'Не назначен')
+        if employee_name is None:
+            employee_name = 'Не назначен'
 
-            # Добавляем информацию о каждой подзадаче
-            for task in task_group:
-                if 'start_date' in task and 'end_date' in task:
-                    message += f"   - Исполнитель: {task.get('employee', 'Не назначен')}\n"
-                    message += f"   - Даты: {task['start_date'].strftime('%d.%m.%Y')} — {task['end_date'].strftime('%d.%m.%Y')}\n"
-                    message += f"   - Длительность: {task['duration']} дней\n"
+        message += f"   - Исполнитель: {employee_name}\n"
 
-                    if task.get('is_critical', False):
-                        message += "   - *Критическая задача*\n"
+        # Безопасное форматирование дат
+        if task.get('start_date') and task.get('end_date'):
+            start_date_str = task['start_date'].strftime('%d.%m.%Y')
+            end_date_str = task['end_date'].strftime('%d.%m.%Y')
+            message += f"   - Даты: {start_date_str} — {end_date_str}\n"
 
-                    if 'reserve' in task and task['reserve'] > 0:
-                        message += f"   - Резерв: {task['reserve']} дней\n"
+        if 'duration' in task:
+            message += f"   - Длительность: {task['duration']} дней\n"
 
-            # Добавляем пустую строку после каждой задачи для лучшей читаемости
-            message += "\n"
+        if task.get('is_critical'):
+            message += "   - Критическая задача\n"
+
+        if task.get('reserve'):
+            message += f"   - Резерв: {task['reserve']} дней\n"
 
     # Добавляем информацию о сотрудниках
-    message += "*Сотрудники:*\n"
+    message += "\n*Сотрудники:*\n"
     employees = set()
     for task in calendar_plan['tasks']:
-        if 'employee' in task and task['employee'] not in ['', 'Не назначен', 'Unassigned']:
-            employees.add(task['employee'])
+        employee = task.get('employee')
+        # Добавляем проверку на None и пустое значение
+        if employee and employee != "Unassigned" and employee != "Не назначен" and employee is not None:
+            employees.add(employee)
 
-    for employee in sorted(employees):
+    for employee in sorted(list(employees)):
         message += f"- {employee}\n"
 
-    # Добавляем информацию о продолжительности проекта
-    if 'project_duration' in calendar_plan:
-        message += f"\n*Общая продолжительность проекта:* {calendar_plan['project_duration']} дней"
+    # Добавляем общую продолжительность проекта
+    message += f"\n*Общая продолжительность проекта:* {calendar_plan['project_duration']} дней"
 
-    # Отправляем сообщение с информацией о проекте
-    await query.edit_message_text(
-        message,
-        reply_markup=plan_actions_keyboard(),
-        parse_mode='Markdown'
-    )
+    try:
+        await query.edit_message_text(
+            message,
+            reply_markup=plan_actions_keyboard(),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        # Если сообщение слишком длинное или возникла другая ошибка
+        error_message = f"Ошибка при отображении информации о проекте: {str(e)}\n\n"
+        error_message += "Попробуйте воспользоваться диаграммой Ганта для визуализации проекта."
+        await query.edit_message_text(
+            error_message,
+            reply_markup=plan_actions_keyboard()
+        )
 
     return BotStates.SHOW_PLAN
 

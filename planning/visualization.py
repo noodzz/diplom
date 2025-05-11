@@ -9,14 +9,17 @@ import random
 
 def generate_gantt_chart(calendar_plan):
     """
-    Генерирует изображение диаграммы Ганта для календарного плана.
+    Generates a clean, professional Gantt chart for the calendar plan with diagonal date labels.
+    Fixed for float/integer conversion issues.
+
+    Args:
+        calendar_plan: Calendar plan with tasks
+
+    Returns:
+        PIL Image object with the Gantt chart
     """
-    tasks = calendar_plan['tasks']
-
-    # Добавим диагностическую печать
-    print(f"Попытка отобразить {len(tasks)} задач")
-
-    if not tasks:
+    # Check if we have tasks
+    if not calendar_plan or 'tasks' not in calendar_plan or not calendar_plan['tasks']:
         image = Image.new('RGB', (400, 200), 'white')
         draw = ImageDraw.Draw(image)
         try:
@@ -26,112 +29,201 @@ def generate_gantt_chart(calendar_plan):
         draw.text((10, 10), "Нет задач для отображения", fill="black", font=font)
         return image
 
-    # Определяем временные границы
+    # Group tasks by name - only keep parent tasks and standalone tasks
+    consolidated_tasks = {}
+    for task in calendar_plan['tasks']:
+        # Skip subtasks with "is_subtask" flag or that have text in name like "- Position"
+        if task.get('is_subtask') or " - " in task.get('name', ""):
+            continue
+
+        task_name = task['name']
+
+        if task_name not in consolidated_tasks:
+            consolidated_tasks[task_name] = task.copy()
+        else:
+            # Update start/end dates if necessary
+            existing = consolidated_tasks[task_name]
+            if task['start_date'] < existing['start_date']:
+                existing['start_date'] = task['start_date']
+            if task['end_date'] > existing['end_date']:
+                existing['end_date'] = task['end_date']
+
+            # Keep critical flag if either is critical
+            if task.get('is_critical'):
+                existing['is_critical'] = True
+
+    # Convert to list and sort by start date
+    tasks = list(consolidated_tasks.values())
+    tasks.sort(key=lambda x: (not x.get('is_critical', False), x['start_date']))
+
+    # Find time boundaries
     start_date = min(task['start_date'] for task in tasks)
     end_date = max(task['end_date'] for task in tasks)
-    project_duration = (end_date - start_date).days + 1
+    total_days = (end_date - start_date).days + 1
 
-    # Настройки изображения
+    # Chart parameters - ensure all are integers
     task_height = 30
+    task_spacing = 15
+    left_margin = 150
+    top_margin = 80
+    right_margin = 50
+    bottom_margin = 60
     day_width = 30
-    margin_left = 250
-    margin_top = 60
-    legend_height = 50
 
-    # Создаем изображение
-    image_width = margin_left + day_width * project_duration
-    image_height = margin_top + task_height * len(tasks) + legend_height
+    # Calculate dimensions - ensure integers
+    width = left_margin + (total_days * day_width) + right_margin
+    height = top_margin + (len(tasks) * (task_height + task_spacing)) + bottom_margin
 
-    image = Image.new('RGB', (image_width, image_height), 'white')
+    # Create image with white background
+    image = Image.new('RGB', (width, height), 'white')
     draw = ImageDraw.Draw(image)
 
-    # Пытаемся загрузить шрифт
+    # Try to load fonts
     try:
-        title_font = ImageFont.truetype('arial.ttf', 16)
-        font = ImageFont.truetype('arial.ttf', 12)
-        small_font = ImageFont.truetype('arial.ttf', 10)
+        title_font = ImageFont.truetype("Arial.ttf", 16)
+        header_font = ImageFont.truetype("Arial.ttf", 12)
+        task_font = ImageFont.truetype("Arial.ttf", 12)
+        small_font = ImageFont.truetype("Arial.ttf", 10)
     except IOError:
-        title_font = ImageFont.load_default()
-        font = ImageFont.load_default()
-        small_font = ImageFont.load_default()
+        try:
+            title_font = ImageFont.truetype("DejaVuSans.ttf", 16)
+            header_font = ImageFont.truetype("DejaVuSans.ttf", 12)
+            task_font = ImageFont.truetype("DejaVuSans.ttf", 12)
+            small_font = ImageFont.truetype("DejaVuSans.ttf", 10)
+        except IOError:
+            title_font = ImageFont.load_default()
+            header_font = ImageFont.load_default()
+            task_font = ImageFont.load_default()
+            small_font = ImageFont.load_default()
 
-    # Добавляем заголовок
-    title = "Диаграмма Ганта проекта"
-    draw.text((image_width // 2 - len(title) * 4, 10), title, fill='black', font=title_font)
+    # Draw title
+    try:
+        text_width = draw.textlength("Диаграмма Ганта проекта", font=title_font)
+    except (AttributeError, TypeError):
+        text_width = 200  # Fallback width
 
-    # Рисуем шкалу времени
+    title_x = max(0, (width // 2) - (int(text_width) // 2))
+    draw.text((title_x, 10), "Диаграмма Ганта проекта", fill="black", font=title_font)
+
+    # Draw time scale with vertical grid lines
     current_date = start_date
-    for day in range(project_duration):
-        x = margin_left + (day * day_width)
+    for day in range(total_days + 1):
+        x = left_margin + (day * day_width)
+
+        # Vertical grid line
+        line_color = '#e0e0e0'
+        draw.line([(x, top_margin), (x, height - bottom_margin)], fill=line_color, width=1)
+
+        # Draw diagonal date labels
         date_str = current_date.strftime('%d.%m')
-        draw.text((x, margin_top - 20), date_str, fill='black', font=font)
-        current_date += timedelta(days=1)
 
-        # Вертикальные линии сетки
-        draw.line([(x, margin_top - 5), (x, image_height - legend_height)], fill='lightgray')
+        # Calculate text dimensions
+        try:
+            text_width = draw.textlength(date_str, font=header_font)
+        except (AttributeError, TypeError):
+            text_width = len(date_str) * 7  # Approximate width
 
-        # Выделяем выходные
+        text_height = 15  # Approximate height of text
+        txt_img = Image.new('RGBA', (int(text_width), text_height), (255, 255, 255, 0))
+        txt_draw = ImageDraw.Draw(txt_img)
+        txt_draw.text((0, 0), date_str, font=header_font, fill='black')
+
+        # Rotate the text image
+        rotated_txt = txt_img.rotate(45, expand=1)
+
+        # Calculate paste position and ensure integers
+        paste_x = max(0, x - 5)
+        paste_y = max(0, top_margin - rotated_txt.height - 5)
+
+        # Paste the rotated text onto the main image
+        image.paste(rotated_txt, (paste_x, paste_y), rotated_txt)
+
+        # Weekend highlighting (Saturday=5, Sunday=6)
         if current_date.weekday() >= 5:
             draw.rectangle(
-                [(x, margin_top), (x + day_width, image_height - legend_height)],
-                fill='#f0f0f0', outline=None
+                [(x, top_margin), (x + day_width, height - bottom_margin)],
+                fill='#f5f5f5',
+                outline=None
             )
 
-    # Рисуем задачи
+        current_date += timedelta(days=1)
+
+    # Draw horizontal grid lines
+    for i in range(len(tasks) + 1):
+        y = top_margin + i * (task_height + task_spacing)
+        draw.line([(left_margin, y), (width - right_margin, y)], fill='#e0e0e0', width=1)
+
+    # Draw tasks
     for i, task in enumerate(tasks):
-        y = margin_top + i * task_height
+        y = top_margin + i * (task_height + task_spacing)
 
-        # Рисуем название задачи
+        # Draw task name
         task_name = task['name']
-        if len(task_name) > 25:
-            task_name = task_name[:22] + "..."
-        draw.text((10, y + 10), task_name, fill='black', font=font)
+        draw.text((10, y + 10), task_name, font=task_font, fill='black')
 
-        # Рисуем исполнителя
-        employee_name = task.get('employee', 'Не назначен')
-        if len(employee_name) > 15:
-            employee_name = employee_name[:12] + "..."
-        draw.text((margin_left - 150, y + 10), employee_name, fill='black', font=font)
+        # Calculate task bar position - ensure integers
+        days_from_start = (task['start_date'] - start_date).days
+        task_duration = (task['end_date'] - task['start_date']).days + 1
 
-        # Вычисляем координаты для задачи
-        days_from_start = max(0, (task['start_date'] - start_date).days)
-        task_duration = max(1, (task['end_date'] - task['start_date']).days + 1)
+        start_x = left_margin + (days_from_start * day_width)
+        end_x = left_margin + ((days_from_start + task_duration) * day_width)
 
-        left = margin_left + days_from_start * day_width
-        top = y + 5
-        right = left + task_duration * day_width
-        bottom = top + task_height - 10
+        # Determine color based on criticality
+        if task.get('is_critical', False):
+            fill_color = '#ff7070'  # Red for critical tasks
+            outline_color = '#cc0000'
+        else:
+            fill_color = '#70a0ff'  # Blue for normal tasks
+            outline_color = '#0055cc'
 
-        # Безопасная проверка для прямоугольника
-        if right <= left:
-            right = left + day_width
+        # Draw task bar
+        draw.rectangle(
+            [start_x, y + 5, end_x - 5, y + task_height - 5],
+            fill=fill_color,
+            outline=outline_color,
+            width=2
+        )
 
-        # Цвет для задачи
-        color = 'red' if task.get('is_critical', False) else 'blue'
+        # Add crosshatch pattern to critical tasks
+        if task.get('is_critical', False):
+            for line_x in range(start_x, int(end_x), 7):  # Ensure integer for range
+                draw.line(
+                    [(line_x, y + 5), (line_x + 7, y + task_height - 5)],
+                    fill='#cc0000',
+                    width=1
+                )
 
-        # Рисуем полосу задачи
-        draw.rectangle([left, top, right, bottom], fill=color, outline='black')
-
-        # Добавляем текст с длительностью
+        # Add duration text
         duration_text = f"{task_duration}д."
-        text_width = len(duration_text) * 6
+        try:
+            text_width = draw.textlength(duration_text, font=small_font)
+        except (AttributeError, TypeError):
+            text_width = len(duration_text) * 6  # Approximate width
 
-        if right - left > text_width + 4:
-            text_x = left + (right - left - text_width) // 2
-            draw.text((text_x, top + 5), duration_text, fill='white', font=small_font)
+        # Calculate centered position and ensure integers
+        text_x = start_x + ((end_x - start_x - int(text_width)) // 2)
+        draw.text(
+            (text_x, y + 10),
+            duration_text,
+            font=small_font,
+            fill='white'
+        )
 
-    # Рисуем легенду
-    legend_y = image_height - legend_height + 10
+    # Draw legend
+    legend_y = height - bottom_margin + 10
 
-    # Критическая задача
-    draw.rectangle([margin_left, legend_y, margin_left + 20, legend_y + 20], fill='red', outline='black')
-    draw.text((margin_left + 25, legend_y + 5), "Критическая задача", fill='black', font=font)
+    # Critical task
+    draw.rectangle([20, legend_y, 50, legend_y + 20], fill='#ff7070', outline='#cc0000', width=2)
+    for line_x in range(20, 50, 7):
+        draw.line([(line_x, legend_y), (line_x + 7, legend_y + 20)], fill='#cc0000', width=1)
+    draw.text((55, legend_y + 3), "Критическая задача", font=task_font, fill='black')
 
-    # Обычная задача
-    draw.rectangle([margin_left + 200, legend_y, margin_left + 220, legend_y + 20], fill='blue', outline='black')
-    draw.text((margin_left + 225, legend_y + 5), "Обычная задача", fill='black', font=font)
+    # Normal task
+    draw.rectangle([230, legend_y, 260, legend_y + 20], fill='#70a0ff', outline='#0055cc', width=2)
+    draw.text((265, legend_y + 3), "Обычная задача", font=task_font, fill='black')
 
     return image
+
 
 def draw_time_scale(draw, start_date, duration, margin_left, margin_top, day_width, image_height, font):
     """

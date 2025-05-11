@@ -19,12 +19,37 @@ def calculate_parent_end_date(parent_task, subtasks, project_start_date):
     return project_start_date + timedelta(days=parent_task.get('early_finish', 0))
 
 
-# planning/calendar.py
+def is_parent_task(task, all_tasks):
+    """
+    Determines if a task is a parent task based on several criteria:
+    1. It has required_employees > 1
+    2. There are subtasks with names like "[task name] - [position]"
+    3. It has no position specified but has a duration
 
-from datetime import datetime, timedelta
-import logging
+    Args:
+        task: The task to check
+        all_tasks: All tasks in the network for checking subtasks
 
-logger = logging.getLogger(__name__)
+    Returns:
+        bool: True if it's a parent task, False otherwise
+    """
+    # Check if task has multiple required employees
+    if task.get('required_employees', 1) > 1:
+        return True
+
+    # Check if task has no position but has duration (common for parent tasks)
+    if not task.get('position') and task.get('duration'):
+        return True
+
+    # Check if there are subtasks with names starting with this task's name
+    task_name = task.get('name', '')
+    for other_task in all_tasks:
+        other_name = other_task.get('name', '')
+        # Check if other task is a subtask of this one
+        if other_name.startswith(task_name + ' - '):
+            return True
+
+    return False
 
 
 def create_calendar_plan(network_parameters, project_data, start_date=None):
@@ -43,6 +68,12 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     logger.info(f"Количество задач в сети: {len(network)}")
     logger.info(f"Количество сотрудников: {len(employees)}")
     logger.info(f"Дата начала проекта: {start_date.strftime('%d.%m.%Y')}")
+
+    # Identify parent tasks and mark them
+    for task in network:
+        task['is_parent'] = is_parent_task(task, network)
+        if task['is_parent']:
+            logger.info(f"Identified parent task: {task['name']}")
 
     # Преобразуем названия дней недели в числовые значения
     days_off_map = {
@@ -97,6 +128,30 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     current_date = start_date
     for task in critical_tasks:
         position = task.get('position', '')
+
+        # ИЗМЕНЕНИЕ: Проверяем, является ли задача родительской
+        if task.get('is_parent', False):
+            # Для родительской задачи не назначаем исполнителя
+            task_start_date = current_date
+            task_end_date = task_start_date + timedelta(days=task['duration'] - 1)
+
+            calendar_plan['tasks'].append({
+                'id': task['id'],
+                'name': task['name'],
+                'start_date': task_start_date,
+                'end_date': task_end_date,
+                'duration': task['duration'],
+                'is_critical': True,
+                'reserve': 0,
+                'employee': None,  # Нет исполнителя для родительской задачи
+                'employee_email': None,
+                'position': '',  # Очищаем позицию для родительской задачи
+                'is_parent': True
+            })
+
+            # Обновляем дату для следующей задачи
+            current_date = task_end_date + timedelta(days=1)
+            continue
 
         # Если у задачи есть назначенный сотрудник из оптимизации
         if 'assigned_employee_id' in task:
@@ -158,6 +213,28 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     for task in non_critical_tasks:
         position = task.get('position', '')
         required_employees = task.get('required_employees', 1)
+
+        # ИЗМЕНЕНИЕ: Проверяем, является ли задача родительской
+        if task.get('is_parent', False):
+            # Определяем даты начала и окончания для родительской задачи
+            # Можно использовать ранний старт и ранний финиш из сетевой модели
+            task_start_date = start_date + timedelta(days=task.get('early_start', 0))
+            task_end_date = start_date + timedelta(days=task.get('early_finish', 0))
+
+            calendar_plan['tasks'].append({
+                'id': task['id'],
+                'name': task['name'],
+                'start_date': task_start_date,
+                'end_date': task_end_date,
+                'duration': task['duration'],
+                'is_critical': False,
+                'reserve': task.get('reserve', 0),
+                'employee': None,  # Нет исполнителя для родительской задачи
+                'employee_email': None,
+                'position': '',  # Очищаем позицию для родительской задачи
+                'is_parent': True
+            })
+            continue
 
         # Обрабатываем задачи с одним исполнителем
         if required_employees == 1:
@@ -244,47 +321,8 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                         'position': position
                     })
 
-        # Обрабатываем групповые задачи (требуется несколько исполнителей)
-        elif required_employees > 1:
-            available_employees = position_employee_map.get(position, [])
-            if available_employees:
-                # Сортируем по нагрузке
-                available_employees = sorted(available_employees, key=lambda e: employee_workload[e['id']])
-
-                # Выбираем требуемое количество сотрудников
-                selected_employees = available_employees[:required_employees]
-
-                if len(selected_employees) == required_employees:
-                    # Создаем задачи для каждого сотрудника
-                    for i, employee in enumerate(selected_employees):
-                        task_start_date, task_end_date = calculate_task_dates(
-                            task, employee['id'], days_off_map.get(employee['id'], []),
-                            start_date, employee_schedule
-                        )
-
-                        # Добавляем в расписание
-                        employee_schedule[employee['id']].append({
-                            'task_id': f"{task['id']}_{i}",
-                            'start_date': task_start_date,
-                            'end_date': task_end_date
-                        })
-
-                        # Обновляем нагрузку
-                        employee_workload[employee['id']] += task['duration']
-
-                        # Добавляем задачу в план
-                        calendar_plan['tasks'].append({
-                            'id': f"{task['id']}_{i}",
-                            'name': task['name'],
-                            'start_date': task_start_date,
-                            'end_date': task_end_date,
-                            'duration': task['duration'],
-                            'is_critical': False,
-                            'reserve': task.get('reserve', 0),
-                            'employee': employee['name'],
-                            'employee_email': employee.get('email', ''),
-                            'position': position
-                        })
+        # Обрабатываем групповые задачи (требуется несколько исполнителей) - эти уже отмечены как is_parent
+        # Этот блок можно оставить, но он не должен выполняться из-за проверки выше
 
     # Проверяем, все ли задачи включены в план
     critical_task_names = set(calendar_plan['critical_path'])
@@ -305,7 +343,8 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                 'is_critical': True,
                 'reserve': 0,
                 'position': task.get('position', ''),
-                'employee': 'Не назначен'
+                'employee': None if task.get('is_parent', False) else 'Не назначен',
+                'is_parent': task.get('is_parent', False)
             })
 
     # Итоги
@@ -419,7 +458,7 @@ def optimize_employee_assignment(network, position_employee_map, employee_schedu
     optimized_network.sort(key=lambda x: (not x['is_critical'], x['early_start']))
 
     # First pass: assign critical tasks
-    for task in [t for t in optimized_network if t.get('is_critical', False)]:
+    for task in [t for t in optimized_network if t.get('is_critical', False) and not t.get('is_parent', False)]:
         # Get the matched position
         matched_position = task_position_map.get(task['id'], task['position'])
 
@@ -468,7 +507,7 @@ def optimize_employee_assignment(network, position_employee_map, employee_schedu
             print(f"No available employees for critical task: {task['name']}")
 
     # Second pass: assign non-critical tasks
-    for task in [t for t in optimized_network if not t.get('is_critical', False)]:
+    for task in [t for t in optimized_network if not t.get('is_critical', False) and not t.get('is_parent', False)]:
         if 'assigned_employee_id' in task:
             continue  # Skip if already assigned
 

@@ -72,6 +72,13 @@ class JiraClient:
                 'issuetype': {'name': issue_type}
             }
 
+            # Если это подзадача и указан parent_key
+            if parent_key and issue_type == 'Sub-task':
+                issue_dict['parent'] = {'key': parent_key}
+                # Убедимся, что issuetype установлен как Sub-task
+                issue_dict['issuetype'] = {'name': 'Sub-task'}
+                logger.info(f"Creating sub-task '{summary}' for parent {parent_key}")
+
             if assignee:
                 # First, try to find user by email
                 user = None
@@ -106,10 +113,10 @@ class JiraClient:
             if priority:
                 issue_dict['priority'] = {'name': priority}
 
-            # If parent key is provided, create a sub-task
+            # Log the issue creation attempt
+            logger.info(f"Creating Jira issue: {summary} (Type: {issue_type})")
             if parent_key:
-                issue_dict['parent'] = {'key': parent_key}
-                issue_dict['issuetype'] = {'name': 'Sub-task'}
+                logger.info(f"  - Parent: {parent_key}")
 
             issue = self.client.create_issue(fields=issue_dict)
             logger.info(f"Created Jira issue {issue.key}: {summary}")
