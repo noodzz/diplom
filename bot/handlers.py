@@ -1342,129 +1342,92 @@ async def show_project_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Добавляем информацию о критическом пути
     message += "*Критический путь:*\n"
-    for task_name in calendar_plan['critical_path']:
-        message += f"- {task_name}\n"
-
-    # Организуем задачи для отображения
-    tasks_by_id = {task['id']: task for task in calendar_plan['tasks']}
-
-    # Находим родительские задачи и их подзадачи
-    parent_tasks = {}
-    standalone_tasks = []
-
-    for task in calendar_plan['tasks']:
-        if task.get('is_parent'):
-            parent_tasks[task['id']] = {
-                'task': task,
-                'subtasks': []
-            }
-        elif not task.get('parent_id') and not task.get('is_subtask'):
-            standalone_tasks.append(task)
-
-    # Добавляем подзадачи к родительским задачам
-    for task in calendar_plan['tasks']:
-        parent_id = task.get('parent_id')
-        if parent_id and parent_id in parent_tasks:
-            parent_tasks[parent_id]['subtasks'].append(task)
-
-    # Сортируем родительские задачи и их подзадачи
-    sorted_parents = sorted(
-        parent_tasks.values(),
-        key=lambda x: x['task'].get('start_date', datetime.now())
-    )
-
-    # Сортируем обычные задачи
-    sorted_standalone = sorted(
-        standalone_tasks,
-        key=lambda x: x.get('start_date', datetime.now())
-    )
+    if isinstance(calendar_plan['critical_path'], list):
+        if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
+            # Если critical_path - список словарей
+            for task in calendar_plan['critical_path']:
+                message += f"- {task['name']}\n"
+        else:
+            # Если critical_path - список строк
+            for task_name in calendar_plan['critical_path']:
+                message += f"- {task_name}\n"
+    else:
+        message += "Критический путь не определен\n"
 
     # Добавляем информацию о задачах
     message += "\n*Задачи:*\n"
 
-    # Сначала добавляем информацию о родительских задачах
-    for parent_info in sorted_parents:
-        parent = parent_info['task']
-        subtasks = parent_info['subtasks']
+    # Группируем задачи по имени для обработки групповых задач
+    tasks_by_name = {}
+    for task in calendar_plan['tasks']:
+        name = task['name']
+        if name not in tasks_by_name:
+            tasks_by_name[name] = []
+        tasks_by_name[name].append(task)
 
-        required_employees = parent.get('required_employees', 1)
+    # Определим, какие задачи являются критическими
+    critical_tasks = set()
+    if isinstance(calendar_plan['critical_path'], list):
+        if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
+            critical_tasks = {task['name'] for task in calendar_plan['critical_path']}
+        else:
+            critical_tasks = set(calendar_plan['critical_path'])
 
-        message += f"\n*{parent['name']}* (Групповая задача"
-        if required_employees > 1:
-            message += f", требуется {required_employees} исполнителей"
-        message += ")\n"
+    # Сначала отображаем критические задачи, затем остальные
+    for is_critical in [True, False]:
+        for task_name, task_group in tasks_by_name.items():
+            # Пропускаем задачи, не соответствующие текущему критерию (критические/некритические)
+            task_is_critical = (task_name in critical_tasks) or any(
+                task.get('is_critical', False) for task in task_group)
+            if task_is_critical != is_critical:
+                continue
 
-        # Добавляем информацию о подзадачах
-        for subtask in subtasks:
-            # Безопасное получение имени исполнителя
-            employee_name = subtask.get('employee', 'Не назначен')
-            if employee_name is None:
-                employee_name = 'Не назначен'
+            required_employees = task_group[0].get('required_employees', 1)
 
-            message += f"   - Исполнитель: {employee_name}\n"
+            # Формируем заголовок задачи
+            if required_employees > 1:
+                message += f"\n*{task_name}* (Групповая задача, требуется {required_employees} исполнителей)\n"
+            else:
+                message += f"\n*{task_name}*\n"
+                if task_is_critical:
+                    message += "   - *Критическая задача*\n"
 
-            # Безопасное форматирование дат
-            start_date_str = subtask['start_date'].strftime('%d.%m.%Y') if subtask.get(
-                'start_date') else 'Не определена'
-            end_date_str = subtask['end_date'].strftime('%d.%m.%Y') if subtask.get('end_date') else 'Не определена'
-            message += f"   - Даты: {start_date_str} — {end_date_str}\n"
+            # Добавляем информацию о каждой подзадаче
+            for task in task_group:
+                if 'start_date' in task and 'end_date' in task:
+                    message += f"   - Исполнитель: {task.get('employee', 'Не назначен')}\n"
+                    message += f"   - Даты: {task['start_date'].strftime('%d.%m.%Y')} — {task['end_date'].strftime('%d.%m.%Y')}\n"
+                    message += f"   - Длительность: {task['duration']} дней\n"
 
-            message += f"   - Длительность: {subtask['duration']} дней\n"
-            if subtask.get('is_critical'):
-                message += "   - Критическая задача\n"
-            if subtask.get('reserve'):
-                message += f"   - Резерв: {subtask['reserve']} дней\n"
+                    if task.get('is_critical', False):
+                        message += "   - *Критическая задача*\n"
 
-    # Затем добавляем информацию о обычных задачах
-    for task in sorted_standalone:
-        message += f"\n*{task['name']}*\n"
+                    if 'reserve' in task and task['reserve'] > 0:
+                        message += f"   - Резерв: {task['reserve']} дней\n"
 
-        # Безопасное получение имени исполнителя
-        employee_name = task.get('employee', 'Не назначен')
-        if employee_name is None:
-            employee_name = 'Не назначен'
-
-        message += f"   - Исполнитель: {employee_name}\n"
-
-        # Безопасное форматирование дат
-        start_date_str = task['start_date'].strftime('%d.%m.%Y') if task.get('start_date') else 'Не определена'
-        end_date_str = task['end_date'].strftime('%d.%m.%Y') if task.get('end_date') else 'Не определена'
-        message += f"   - Даты: {start_date_str} — {end_date_str}\n"
-
-        message += f"   - Длительность: {task['duration']} дней\n"
-        if task.get('is_critical'):
-            message += "   - Критическая задача\n"
-        if task.get('reserve'):
-            message += f"   - Резерв: {task['reserve']} дней\n"
+            # Добавляем пустую строку после каждой задачи для лучшей читаемости
+            message += "\n"
 
     # Добавляем информацию о сотрудниках
-    message += "\n*Сотрудники:*\n"
+    message += "*Сотрудники:*\n"
     employees = set()
     for task in calendar_plan['tasks']:
-        employee = task.get('employee')
-        if employee and employee != "Unassigned" and employee != "Не назначен":
-            employees.add(employee)
+        if 'employee' in task and task['employee'] not in ['', 'Не назначен', 'Unassigned']:
+            employees.add(task['employee'])
 
-    for employee in sorted(list(employees)):
+    for employee in sorted(employees):
         message += f"- {employee}\n"
 
-    # Добавляем общую продолжительность проекта
-    message += f"\n*Общая продолжительность проекта:* {calendar_plan['project_duration']} дней"
+    # Добавляем информацию о продолжительности проекта
+    if 'project_duration' in calendar_plan:
+        message += f"\n*Общая продолжительность проекта:* {calendar_plan['project_duration']} дней"
 
-    try:
-        await query.edit_message_text(
-            message,
-            reply_markup=plan_actions_keyboard(),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        # Если сообщение слишком длинное или возникла другая ошибка
-        error_message = f"Ошибка при отображении информации о проекте: {str(e)}\n\n"
-        error_message += "Попробуйте воспользоваться диаграммой Ганта для визуализации проекта."
-        await query.edit_message_text(
-            error_message,
-            reply_markup=plan_actions_keyboard()
-        )
+    # Отправляем сообщение с информацией о проекте
+    await query.edit_message_text(
+        message,
+        reply_markup=plan_actions_keyboard(),
+        parse_mode='Markdown'
+    )
 
     return BotStates.SHOW_PLAN
 
