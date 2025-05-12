@@ -140,22 +140,45 @@ async def select_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for setting project start date."""
     query = update.callback_query
+    logger.info("set_project_start_date handler called")
     await query.answer()
 
     # Update the message to ask for a start date
-    await query.edit_message_text(
-        "Укажите дату начала проекта в формате ДД.ММ.ГГГГ (например, 06.05.2025).\n\n"
-        "Можно также указать 'сегодня', 'завтра' или '+N' (где N - количество дней от текущей даты).",
-        reply_markup=InlineKeyboardMarkup([[
+    keyboard = [
+        [
             InlineKeyboardButton("Сегодня", callback_data="date_today"),
             InlineKeyboardButton("Завтра", callback_data="date_tomorrow")
-        ], [
+        ],
+        [
             InlineKeyboardButton("Через неделю", callback_data="date_plus7"),
             InlineKeyboardButton("Через 2 недели", callback_data="date_plus14")
-        ], [
+        ],
+        [
+            InlineKeyboardButton("Первый день месяца", callback_data="date_month_start"),
+            InlineKeyboardButton("Произвольная дата", callback_data="date_custom")
+        ],
+        [
             InlineKeyboardButton("Отмена", callback_data="back_to_project")
-        ]])
-    )
+        ]
+    ]
+
+    # Update message with date selection options
+    try:
+        await query.edit_message_text(
+            "Укажите дату начала проекта:\n\n"
+            "Выберите из предложенных вариантов или нажмите 'Произвольная дата' для ввода своей даты в формате ДД.ММ.ГГГГ.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info("Date selection message sent successfully")
+    except Exception as e:
+        logger.error(f"Error in set_project_start_date: {str(e)}")
+        # Fallback message if there's an error
+        await query.message.reply_text(
+            "Произошла ошибка. Пожалуйста, попробуйте еще раз выбрать дату начала проекта.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="back_to_project")]
+            ])
+        )
 
     return BotStates.SET_START_DATE
 
@@ -163,9 +186,9 @@ async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_T
 async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process the start date input from user."""
     from datetime import datetime, timedelta
+    import calendar
 
     if update.callback_query:
-        # Handle quick date selections
         query = update.callback_query
         await query.answer()
 
@@ -179,8 +202,16 @@ async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
             start_date = today + timedelta(days=7)
         elif query.data == "date_plus14":
             start_date = today + timedelta(days=14)
+        elif query.data == "date_month_start":
+            # First day of current month
+            start_date = today.replace(day=1)
+        elif query.data == "date_custom":
+            return await request_custom_date(update, context)
         elif query.data == "back_to_project":
-            # User canceled, go back to project view
+            return await select_project(update, context)
+        else:
+            # Unknown callback data
+            logger.warning(f"Unknown callback data in process_start_date: {query.data}")
             return await select_project(update, context)
 
         # Store the date in context
@@ -201,7 +232,8 @@ async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 reply_markup=main_menu_keyboard()
             )
         return BotStates.ADD_TASK
-        # Handle text input for custom date
+
+    # Handle text input for custom date
     text = update.message.text.strip()
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -224,25 +256,23 @@ async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Confirm the date setting
         await update.message.reply_text(
             f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")
-            ], [
-                InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")
-            ]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+                [InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")]
+            ])
         )
         return BotStates.ADD_TASK
 
     except (ValueError, IndexError):
         # Handle invalid date format
         await update.message.reply_text(
-            "Неверный формат даты. Пожалуйста, укажите дату в формате ДД.ММ.ГГГГ (например, 06.05.2025) "
+            "Неверный формат даты. Пожалуйста, укажите дату в формате ДД.ММ.ГГГГ (например, 15.05.2025) "
             "или используйте 'сегодня', 'завтра' или '+N' дней.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Отмена", callback_data="back_to_project")
-            ]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="back_to_project")]
+            ])
         )
         return BotStates.SET_START_DATE
-
 
 async def show_project_with_message(query, context, project_id, message):
     """Show project details with a message."""
@@ -380,106 +410,79 @@ async def process_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик создания нового проекта."""
+    """Handler for creating a new project."""
     query = update.callback_query
 
     if query and query.data == 'create_project':
         await query.answer()
-        # Переходим к выбору типа проекта
+        # Go to project type selection
         return await select_project_type(update, context)
 
-    # Если пришел текст с названием проекта
+    # Get project name from text
     project_name = update.message.text
 
-    # Проверяем, какой способ создания проекта был выбран
+    # Create project based on the selected method
     if 'template_id' in context.user_data:
-        # Создаем проект на основе шаблона
+        # Create from template
         template_id = context.user_data['template_id']
         project_id = create_project_from_template(template_id, project_name)
-
-        # Сохраняем ID проекта в контексте
         context.user_data['current_project_id'] = project_id
-
-        # Получаем данные проекта
         project_data = get_project_data(project_id)
-
-        # Сохраняем задачи в контексте
         context.user_data['tasks'] = project_data['tasks']
 
-        # Автоматически назначаем сотрудников на проект
-        from utils.employee_assignment import auto_assign_employees_to_project  # Импортируем новую функцию
-        assigned_employees = auto_assign_employees_to_project(project_id)
-
-        # Обновляем данные проекта после добавления сотрудников
+        # Auto-assign employees
+        from utils.employee_assignment import auto_assign_employees_to_project
+        auto_assign_employees_to_project(project_id)
         project_data = get_project_data(project_id)
-
-        # Сохраняем сотрудников в контексте
         context.user_data['employees'] = project_data['employees']
 
-        # Переходим сразу к расчету плана, так как у нас есть все необходимые данные
-        await update.message.reply_text(
-            f"Проект '{project_name}' создан на основе шаблона. Сотрудники автоматически назначены. Теперь вы можете рассчитать календарный план."
-        )
-
-        # Создаем клавиатуру с действиями для проекта
+        # Ask for start date
         keyboard = [
-            [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
-            [InlineKeyboardButton("Редактировать задачи", callback_data="edit_tasks")],
-            [InlineKeyboardButton("Редактировать сотрудников", callback_data="edit_employees")],
-            [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
+            [InlineKeyboardButton("Указать дату начала", callback_data="set_start_date")],
+            [InlineKeyboardButton("Рассчитать с сегодняшней даты", callback_data="calculate")]
         ]
-
         await update.message.reply_text(
-            f"Выберите дальнейшие действия:",
+            f"Проект '{project_name}' создан на основе шаблона. Сотрудники автоматически назначены.\n\n"
+            f"Укажите дату начала проекта или рассчитайте план с сегодняшней даты:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-        return BotStates.ADD_TASK
-
     elif 'csv_tasks' in context.user_data:
-        # Create project from CSV tasks
+        # Create from CSV
         csv_tasks = context.user_data['csv_tasks']
-
-        # Use the new function instead of manually creating tasks
         project_id = create_project_from_tasks(project_name, csv_tasks)
 
         if not project_id:
-            await update.message.reply_text("Error creating project from CSV. Please try again.")
+            await update.message.reply_text("Ошибка при создании проекта из CSV. Попробуйте еще раз.")
             return BotStates.CREATE_PROJECT
 
-        # Save project ID in context
         context.user_data['current_project_id'] = project_id
-
-        # Get project data to update context
         project_data = get_project_data(project_id)
         context.user_data['tasks'] = project_data['tasks']
         context.user_data['employees'] = project_data['employees']
 
+        # Ask for start date
         keyboard = [
-            [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
-            [InlineKeyboardButton("Редактировать сотрудников", callback_data="edit_employees")],
-            [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
+            [InlineKeyboardButton("Указать дату начала", callback_data="set_start_date")],
+            [InlineKeyboardButton("Рассчитать с сегодняшней даты", callback_data="calculate")]
         ]
-
         await update.message.reply_text(
-            f"Project '{project_name}' successfully created from CSV! Choose next action:",
+            f"Проект '{project_name}' успешно создан из CSV!\n\n"
+            f"Укажите дату начала проекта или рассчитайте план с сегодняшней даты:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-        return BotStates.SELECT_PROJECT
-
     else:
-        # Обычное создание проекта
+        # Normal project creation
         project_id = create_new_project(project_name)
-
-        # Сохраняем ID проекта в контексте
         context.user_data['current_project_id'] = project_id
         context.user_data['tasks'] = []
 
         await update.message.reply_text(
             f"Проект '{project_name}' создан. Теперь добавьте задачи.\n\n{ADD_TASK_PROMPT}"
         )
-        return BotStates.ADD_TASK
+
+    return BotStates.ADD_TASK
 
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -766,59 +769,61 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик расчета календарного плана."""
+    """Handler for calculating calendar plan."""
     query = update.callback_query
     await query.answer()
 
     await safe_edit_message_text(query, PLAN_CALCULATION_START)
 
-    # Получаем данные проекта из БД
+    # Get project data
     project_id = context.user_data['current_project_id']
     project_data = get_project_data(project_id)
 
-    # Если нет сотрудников в проекте, используем сотрудников из контекста
+    # If no employees in project, use employees from context
     if not project_data['employees'] and 'employees' in context.user_data:
         project_data['employees'] = context.user_data['employees']
 
-    # Рассчитываем параметры сетевой модели
+    # Calculate network parameters
     network_parameters = calculate_network_parameters(project_data)
 
-    # Get the start date from context or use today
+    # Get start date from context or use today's date
     start_date = context.user_data.get('project_start_date')
+    if not start_date:
+        # Set default to today
+        start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        context.user_data['project_start_date'] = start_date
+        logger.info(f"No start date specified, using today: {start_date}")
 
-    # Создаем календарный план с учетом выходных дней и стартовой даты
+    # Create calendar plan with days off and start date
     calendar_plan = create_calendar_plan(network_parameters, project_data, start_date)
 
-    # Сохраняем результаты в контексте
+    # Save results in context
     context.user_data['calendar_plan'] = calendar_plan
 
-    # Генерируем изображение диаграммы Ганта
+    # Generate Gantt chart
     gantt_image = generate_gantt_chart(calendar_plan)
     gantt_buffer = io.BytesIO()
     gantt_image.save(gantt_buffer, format='PNG')
     gantt_buffer.seek(0)
 
     # Format start and end dates for the report
-    start_date_str = start_date.strftime('%d.%m.%Y') if start_date else "не указана"
+    start_date_str = start_date.strftime('%d.%m.%Y')
 
     # Calculate end date based on start date and project duration
-    if start_date and 'project_duration' in calendar_plan:
+    if 'project_duration' in calendar_plan:
         from datetime import timedelta
         end_date = start_date + timedelta(days=calendar_plan['project_duration'])
         end_date_str = end_date.strftime('%d.%m.%Y')
     else:
         end_date_str = "не определена"
 
-    # Формируем текстовый отчет
+    # Form text report
     if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
-        # Если critical_path содержит словари, извлекаем имена задач
         critical_path_text = "Критический путь: " + " -> ".join(
             [task['name'] for task in calendar_plan['critical_path']])
     elif calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], str):
-        # Если critical_path уже содержит строки (имена задач)
         critical_path_text = "Критический путь: " + " -> ".join(calendar_plan['critical_path'])
     else:
-        # Если critical_path пуст или имеет неожиданный формат
         critical_path_text = "Критический путь не определен"
 
     project_duration = calendar_plan['project_duration']
@@ -840,7 +845,7 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         report += f"- {task['name']}: {task['reserve']} дней\n"
 
-    # Отправляем отчет и диаграмму
+    # Send report and diagram
     await query.message.reply_photo(
         photo=gantt_buffer,
         caption="Диаграмма Ганта для календарного плана"
@@ -1520,52 +1525,50 @@ async def show_project_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return BotStates.SHOW_PLAN
 
+
 async def back_to_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик возврата к задачам."""
-    query = update.callback_query
-    await query.answer()
+    """Handler for going back to tasks."""
 
-    project_id = context.user_data.get('current_project_id')
-    if not project_id:
-        await query.edit_message_text(
-            "Ошибка: проект не найден. Пожалуйста, выберите проект заново.",
-            reply_markup=main_menu_keyboard()
-        )
-        return BotStates.MAIN_MENU
+    def get_tasks_message(context):
+        project_id = context.user_data.get('current_project_id')
+        if not project_id:
+            raise ValueError("Project ID not found")
 
-    # Получаем данные проекта
-    project_data = get_project_data(project_id)
-    if not project_data:
-        await query.edit_message_text(
-            "Проект не найден или был удален.",
-            reply_markup=main_menu_keyboard()
-        )
-        return BotStates.MAIN_MENU
+        project_data = get_project_data(project_id)
+        if not project_data:
+            raise ValueError("Project not found")
 
-    # Формируем сообщение с информацией о задачах
-    message = f"📊 *Проект: {project_data['name']}*\n\n"
-    message += f"*Задачи:* {len(project_data['tasks'])}\n\n"
+        message = f"📊 *Проект: {project_data['name']}*\n\n"
+        message += f"*Задачи:* {len(project_data['tasks'])}\n\n"
 
-    if project_data['tasks']:
-        message += "*Список задач:*\n"
-        for i, task in enumerate(project_data['tasks']):
-            message += f"{i + 1}. {task['name']} ({task['duration']} дн.) - {task['position']}\n"
-    else:
-        message += "Задачи еще не добавлены.\n"
+        if project_data['tasks']:
+            message += "*Список задач:*\n"
+            for i, task in enumerate(project_data['tasks'][:10]):  # Limit to 10 tasks to avoid long messages
+                message += f"{i + 1}. {task['name']} ({task['duration']} дн.) - {task['position']}\n"
 
-    message += "\nДобавьте информацию о задаче в формате:\n"
-    message += "<название задачи> | <длительность в днях> | <должность исполнителя>\n\n"
-    message += "Например: Создание тарифов обучения | 1 | Технический специалист"
+            if len(project_data['tasks']) > 10:
+                message += f"...и еще {len(project_data['tasks']) - 10} задач\n"
+        else:
+            message += "Задачи еще не добавлены.\n"
 
-    await query.edit_message_text(
-        message,
-        reply_markup=task_actions_keyboard(),
-        parse_mode='Markdown'
+        message += "\nДобавьте информацию о задаче в формате:\n"
+        message += "<название задачи> | <длительность в днях> | <должность исполнителя>\n\n"
+        message += "Например: Создание тарифов обучения | 1 | Технический специалист"
+
+        return message
+
+    return await handle_back_button(
+        update,
+        context,
+        BotStates.ADD_TASK,
+        get_tasks_message,
+        task_actions_keyboard
     )
-    return BotStates.ADD_TASK
+
 
 async def back_to_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик возврата к зависимостям."""
+    """Handler for going back to dependencies."""
+    logger.info("Starting back_to_dependencies handler")
     query = update.callback_query
     await query.answer()
 
@@ -1577,7 +1580,7 @@ async def back_to_dependencies(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return BotStates.MAIN_MENU
 
-    # Получаем данные проекта
+    # Get project data
     project_data = get_project_data(project_id)
     if not project_data:
         await query.edit_message_text(
@@ -1586,12 +1589,13 @@ async def back_to_dependencies(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return BotStates.MAIN_MENU
 
-    # Формируем сообщение с информацией о зависимостях
+    # Create message about dependencies
     message = f"📊 *Проект: {project_data['name']}*\n\n"
     message += "Укажите зависимости между задачами в формате:\n"
     message += "<название задачи> | <зависимости через запятую>\n\n"
     message += "Например: Задача 2 | Задача 1, Задача 3\n\n"
     message += "Список задач:\n"
+
     for i, task in enumerate(project_data['tasks']):
         message += f"{i + 1}. {task['name']}\n"
 
@@ -1602,8 +1606,10 @@ async def back_to_dependencies(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return BotStates.ADD_DEPENDENCIES
 
+
 async def back_to_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик возврата к сотрудникам."""
+    """Handler for going back to employees."""
+    logger.info("Starting back_to_employees handler")
     query = update.callback_query
     await query.answer()
 
@@ -1615,7 +1621,7 @@ async def back_to_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return BotStates.MAIN_MENU
 
-    # Получаем данные проекта
+    # Get project data
     project_data = get_project_data(project_id)
     if not project_data:
         await query.edit_message_text(
@@ -1624,7 +1630,7 @@ async def back_to_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return BotStates.MAIN_MENU
 
-    # Формируем сообщение с информацией о сотрудниках
+    # Create message about employees
     message = f"📊 *Проект: {project_data['name']}*\n\n"
     message += f"*Сотрудники:* {len(project_data['employees'])}\n\n"
 
@@ -1636,9 +1642,7 @@ async def back_to_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         message += "Сотрудники еще не добавлены.\n"
 
-    message += "\nДобавьте информацию о сотруднике в формате:\n"
-    message += "<имя> | <должность> | <выходные через запятую>\n\n"
-    message += "Например: Иванов Иван | Технический специалист | Суббота, Воскресенье"
+    message += "\nВыберите действие:"
 
     await query.edit_message_text(
         message,
@@ -1824,3 +1828,427 @@ async def save_task_description(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Описание сохранено.")
     # Возвращаем предпросмотр
     return await preview_before_export(update, context)
+
+
+def generate_project_text_report(calendar_plan):
+    """
+    Generates a text report of the project information.
+
+    Args:
+        calendar_plan: Calendar plan data
+
+    Returns:
+        Text report as string
+    """
+    report = "ИНФОРМАЦИЯ О ПРОЕКТЕ\n"
+    report += "=" * 40 + "\n\n"
+
+    # Project duration
+    report += f"Общая продолжительность проекта: {calendar_plan['project_duration']} дней\n\n"
+
+    # Critical path
+    report += "КРИТИЧЕСКИЙ ПУТЬ:\n"
+    report += "-" * 40 + "\n"
+    if isinstance(calendar_plan['critical_path'], list):
+        if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
+            for task in calendar_plan['critical_path']:
+                report += f"- {task['name']}\n"
+        else:
+            for task_name in calendar_plan['critical_path']:
+                report += f"- {task_name}\n"
+    report += "\n"
+
+    # Group tasks by parent/standalone
+    parent_tasks = {}
+    standalone_tasks = []
+
+    for task in calendar_plan['tasks']:
+        if task.get('is_parent') or task.get('required_employees', 1) > 1:
+            parent_tasks[task['id']] = {
+                'task': task,
+                'subtasks': []
+            }
+        elif not task.get('parent_id') and not task.get('is_subtask'):
+            if ' - ' not in task.get('name', ''):
+                standalone_tasks.append(task)
+
+    # Add subtasks to parent tasks
+    for task in calendar_plan['tasks']:
+        name = task.get('name', '')
+        if ' - ' in name:
+            base_name = name.split(' - ')[0]
+
+            # Find parent task by name
+            for parent_id, parent_data in parent_tasks.items():
+                parent_name = parent_data['task'].get('name', '')
+                if parent_name == base_name:
+                    parent_data['subtasks'].append(task)
+                    break
+
+    # Add tasks to report
+    report += "ЗАДАЧИ:\n"
+    report += "-" * 40 + "\n\n"
+
+    # Add parent tasks with subtasks
+    for parent_id, parent_data in parent_tasks.items():
+        parent = parent_data['task']
+        subtasks = parent_data['subtasks']
+
+        report += f"ГРУППОВАЯ ЗАДАЧА: {parent.get('name')}\n"
+
+        # Basic parent task info
+        if parent.get('start_date') and parent.get('end_date'):
+            start_date_str = parent['start_date'].strftime('%d.%m.%Y')
+            end_date_str = parent['end_date'].strftime('%d.%m.%Y')
+            report += f"Даты: {start_date_str} — {end_date_str}\n"
+
+        if 'duration' in parent:
+            report += f"Длительность: {parent['duration']} дней\n"
+
+        report += f"Критическая задача: {'Да' if parent.get('is_critical') else 'Нет'}\n"
+
+        if parent.get('reserve'):
+            report += f"Резерв: {parent['reserve']} дней\n"
+
+        # Add subtasks
+        if subtasks:
+            report += "\nПодзадачи:\n"
+
+            for subtask in subtasks:
+                subtask_name = subtask.get('name', '')
+                if ' - ' in subtask_name:
+                    position = subtask_name.split(' - ')[1]
+                    report += f"  * {position}:\n"
+                else:
+                    report += f"  * Подзадача:\n"
+
+                employee_name = subtask.get('employee', 'Не назначен')
+                if employee_name is None:
+                    employee_name = 'Не назначен'
+
+                report += f"    Исполнитель: {employee_name}\n"
+
+                if subtask.get('start_date') and subtask.get('end_date'):
+                    start_date_str = subtask['start_date'].strftime('%d.%m.%Y')
+                    end_date_str = subtask['end_date'].strftime('%d.%m.%Y')
+                    report += f"    Даты: {start_date_str} — {end_date_str}\n"
+
+                if 'duration' in subtask:
+                    report += f"    Длительность: {subtask['duration']} дней\n"
+
+                if subtask.get('is_critical'):
+                    report += f"    Критическая задача: Да\n"
+
+                if subtask.get('reserve'):
+                    report += f"    Резерв: {subtask['reserve']} дней\n"
+
+                report += "\n"
+        else:
+            report += "Подзадачи не назначены\n"
+
+        report += "-" * 40 + "\n\n"
+
+    # Add standalone tasks
+    if standalone_tasks:
+        report += "ОТДЕЛЬНЫЕ ЗАДАЧИ:\n"
+        report += "-" * 40 + "\n\n"
+
+        for task in standalone_tasks:
+            report += f"ЗАДАЧА: {task.get('name')}\n"
+
+            employee_name = task.get('employee', 'Не назначен')
+            if employee_name is None:
+                employee_name = 'Не назначен'
+
+            report += f"Исполнитель: {employee_name}\n"
+
+            if task.get('start_date') and task.get('end_date'):
+                start_date_str = task['start_date'].strftime('%d.%m.%Y')
+                end_date_str = task['end_date'].strftime('%d.%m.%Y')
+                report += f"Даты: {start_date_str} — {end_date_str}\n"
+
+            if 'duration' in task:
+                report += f"Длительность: {task['duration']} дней\n"
+
+            report += f"Критическая задача: {'Да' if task.get('is_critical') else 'Нет'}\n"
+
+            if task.get('reserve'):
+                report += f"Резерв: {task['reserve']} дней\n"
+
+            report += "-" * 40 + "\n\n"
+
+    # Add employee summary
+    report += "СОТРУДНИКИ:\n"
+    report += "-" * 40 + "\n"
+
+    employees = set()
+    for task in calendar_plan['tasks']:
+        employee = task.get('employee')
+        if employee and employee != "Unassigned" and employee != "Не назначен" and employee is not None:
+            employees.add(employee)
+
+    for employee in sorted(list(employees)):
+        report += f"- {employee}\n"
+
+    return report
+
+
+async def export_project_info_as_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exports project information as a text file."""
+    query = update.callback_query
+    await query.answer()
+
+    # Get calendar plan
+    calendar_plan = context.user_data.get('calendar_plan')
+    if not calendar_plan:
+        await query.edit_message_text(
+            "Ошибка: календарный план не найден. Сначала рассчитайте план.",
+            reply_markup=plan_actions_keyboard()
+        )
+        return BotStates.SHOW_PLAN
+
+    # Generate text report
+    text_report = generate_project_text_report(calendar_plan)
+
+    # Create file buffer
+    buffer = io.BytesIO(text_report.encode('utf-8'))
+    buffer.name = "project_info.txt"
+
+    # Send file to user
+    await query.message.reply_document(
+        document=buffer,
+        filename="project_info.txt",
+        caption="Информация о проекте в текстовом формате"
+    )
+
+    return BotStates.SHOW_PLAN
+
+
+async def handle_back_button(update: Update, context: ContextTypes.DEFAULT_TYPE, target_state, message_function,
+                             keyboard_function):
+    """
+    Generic handler for back buttons to ensure consistent behavior.
+
+    Args:
+        update: Update object
+        context: Context object
+        target_state: The state to transition to
+        message_function: Function that generates the message text
+        keyboard_function: Function that generates the keyboard
+
+    Returns:
+        The target state
+    """
+    query = update.callback_query
+    await query.answer()
+
+    try:
+        # Generate message and keyboard
+        message = message_function(context)
+        keyboard = keyboard_function()
+
+        # Update the message
+        await safe_edit_message_text(
+            query,
+            message,
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        return target_state
+    except Exception as e:
+        logger.error(f"Error in back button handler: {str(e)}")
+        # Fallback to main menu on error
+        await query.edit_message_text(
+            "Произошла ошибка при переходе назад. Возвращаюсь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+
+async def add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler specifically for adding a new employee."""
+    logger.info("Starting add_employee handler")
+    query = update.callback_query
+    await query.answer()
+
+    # Show the form for adding a new employee
+    await safe_edit_message_text(
+        query,
+        "Добавьте информацию о сотруднике в формате:\n"
+        "<имя> | <должность> | <выходные через запятую>\n\n"
+        "Например: Иванов Иван | Технический специалист | Суббота, Воскресенье",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Отмена", callback_data="back_to_employees")]
+        ])
+    )
+    return BotStates.ADD_EMPLOYEES
+
+
+async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for showing available positions."""
+    logger.info("Starting show_positions handler")
+    query = update.callback_query
+    await query.answer()
+
+    # Get all positions
+    positions = get_all_positions()
+
+    if not positions:
+        await safe_edit_message_text(
+            query,
+            "В базе данных нет сохраненных должностей. Пожалуйста, добавьте сотрудника вручную.",
+            reply_markup=employees_actions_keyboard()
+        )
+        return BotStates.ADD_EMPLOYEES
+
+    # Save positions in context
+    context.user_data['available_positions'] = positions
+
+    # Show position selection
+    await safe_edit_message_text(
+        query,
+        "Выберите должность сотрудника:",
+        reply_markup=position_selection_keyboard(positions)
+    )
+    return BotStates.SELECT_POSITION
+
+
+async def handle_position_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for when a position is selected."""
+    logger.info("Starting handle_position_selection handler")
+    query = update.callback_query
+    await query.answer()
+
+    # Get the position hash from callback data
+    position_hash = int(query.data.replace('pos_', ''))
+
+    # Find the position by hash
+    positions = context.user_data.get('available_positions', [])
+    position = next((p for p in positions if hash(p) % 1000000 == position_hash), None)
+
+    if not position:
+        await safe_edit_message_text(
+            query,
+            "Должность не найдена. Пожалуйста, попробуйте еще раз.",
+            reply_markup=employees_actions_keyboard()
+        )
+        return BotStates.ADD_EMPLOYEES
+
+    logger.info(f"Selected position: {position}")
+
+    # Save the selected position
+    context.user_data['selected_position'] = position
+
+    # Get employees with this position
+    employees = get_employees_by_position(position=position)
+
+    if not employees:
+        # No employees found for this position
+        keyboard = [
+            [InlineKeyboardButton("Добавить нового сотрудника", callback_data="add_new_employee")],
+            [InlineKeyboardButton("Назад", callback_data="back_to_positions")]
+        ]
+        await safe_edit_message_text(
+            query,
+            f"Сотрудники с должностью '{position}' не найдены. Хотите добавить нового сотрудника?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        # Show list of employees for selection
+        message = f"Выберите сотрудника на должность '{position}':\n\n"
+        keyboard = []
+
+        for employee in employees:
+            days_off_str = ", ".join(employee['days_off']) if employee['days_off'] else "Без выходных"
+            message += f"- {employee['name']} (Выходные: {days_off_str})\n"
+            keyboard.append([
+                InlineKeyboardButton(employee['name'], callback_data=f"select_employee_{employee['id']}")
+            ])
+
+        keyboard.append([InlineKeyboardButton("Добавить нового сотрудника", callback_data="add_new_employee")])
+        keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_positions")])
+
+        await safe_edit_message_text(
+            query,
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    return BotStates.SELECT_EMPLOYEE
+
+
+async def handle_employee_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for when an employee is selected."""
+    logger.info("Starting handle_employee_selection handler")
+    query = update.callback_query
+    await query.answer()
+
+    # Get employee ID from callback data
+    employee_id = int(query.data.replace('select_employee_', ''))
+    logger.info(f"Selected employee ID: {employee_id}")
+
+    # Get project ID
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await safe_edit_message_text(
+            query,
+            "Ошибка: не найден ID проекта. Пожалуйста, выберите проект заново.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Add employee to project
+    result = add_employee_to_project(employee_id, project_id)
+
+    if result:
+        await safe_edit_message_text(
+            query,
+            "Сотрудник успешно добавлен в проект!",
+            reply_markup=employees_actions_keyboard()
+        )
+    else:
+        await safe_edit_message_text(
+            query,
+            "Ошибка при добавлении сотрудника в проект. Возможно, сотрудник уже добавлен.",
+            reply_markup=employees_actions_keyboard()
+        )
+
+    return BotStates.ADD_EMPLOYEES
+
+
+async def back_to_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for going back to position selection."""
+    logger.info("Starting back_to_positions handler")
+    query = update.callback_query
+    await query.answer()
+
+    # Get all positions again
+    positions = get_all_positions()
+
+    # Show position selection
+    await safe_edit_message_text(
+        query,
+        "Выберите должность сотрудника:",
+        reply_markup=position_selection_keyboard(positions)
+    )
+    return BotStates.SELECT_POSITION
+
+
+async def request_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for requesting custom date input."""
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "Введите дату начала проекта в формате ДД.ММ.ГГГГ (например, 15.05.2025).\n\n"
+        "Или используйте относительный формат:\n"
+        "• 'сегодня'\n"
+        "• 'завтра'\n"
+        "• '+N' (через N дней от текущей даты)",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Отмена", callback_data="back_to_project")]
+        ])
+    )
+
+    context.user_data['awaiting_custom_date'] = True
+    return BotStates.SET_START_DATE

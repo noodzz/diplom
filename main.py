@@ -18,8 +18,10 @@ from bot.handlers import (
     create_project, add_task, list_projects, add_dependencies,
     add_employees, calculate_plan, export_to_jira, cancel,
     back_to_main, back_to_project_type, select_project, process_start_date, add_user, list_users, remove_user,
-    get_my_id, set_project_start_date, show_project_info, back_to_tasks, back_to_dependencies, back_to_employees, back_to_plan,
-    edit_task_description, save_task_description, preview_before_export
+    get_my_id, set_project_start_date, show_project_info, back_to_tasks, back_to_dependencies, back_to_employees,
+    back_to_plan,
+    edit_task_description, save_task_description, preview_before_export, export_project_info_as_file, show_positions,
+    add_employee, handle_position_selection, handle_employee_selection, back_to_positions, request_custom_date
 )
 from bot.states import BotStates
 from config import BOT_TOKEN
@@ -115,26 +117,23 @@ def main():
                 CommandHandler('cancel', cancel)
             ],
             BotStates.ADD_EMPLOYEES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_employees),
-                CallbackQueryHandler(add_employees, pattern='^add_employee$'),
-                CallbackQueryHandler(add_employees, pattern='^pos_'),
-                CallbackQueryHandler(add_employees, pattern='^select_employee_'),
-                CallbackQueryHandler(add_employees, pattern='^back_to_positions$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_employees),  # Keep original handler for text input
+                CallbackQueryHandler(add_employee, pattern='^add_employee$'),
+                CallbackQueryHandler(show_positions, pattern='^add_employees$'),
                 CallbackQueryHandler(calculate_plan, pattern='^calculate$'),
-                CallbackQueryHandler(back_to_employees, pattern='^back_to_employees$'),
                 CallbackQueryHandler(back_to_dependencies, pattern='^back_to_dependencies$'),
                 CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
-                CallbackQueryHandler(back_to_project_type, pattern='^back_to_project_type$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.SELECT_POSITION: [
-                CallbackQueryHandler(add_employees, pattern='^pos_'),
+                CallbackQueryHandler(handle_position_selection, pattern='^pos_'),
                 CallbackQueryHandler(back_to_employees, pattern='^back_to_employees$'),
                 CallbackQueryHandler(cancel, pattern='^cancel$')
             ],
             BotStates.SELECT_EMPLOYEE: [
-                CallbackQueryHandler(add_employees, pattern='^select_employee_'),
-                CallbackQueryHandler(add_employees, pattern='^back_to_positions$'),
+                CallbackQueryHandler(handle_employee_selection, pattern='^select_employee_'),
+                CallbackQueryHandler(back_to_positions, pattern='^back_to_positions$'),
+                CallbackQueryHandler(add_employee, pattern='^add_new_employee$'),
                 CallbackQueryHandler(cancel, pattern='^cancel$')
             ],
             BotStates.ADD_EMPLOYEE_NAME: [
@@ -156,6 +155,7 @@ def main():
             BotStates.SHOW_PLAN: [
                 CallbackQueryHandler(export_to_jira, pattern='^export_jira$'),
                 CallbackQueryHandler(show_project_info, pattern='^show_project_info$'),
+                CallbackQueryHandler(export_project_info_as_file, pattern='^export_project_info$'),  # Add this line
                 CallbackQueryHandler(preview_before_export, pattern='^preview_before_export$'),
                 CallbackQueryHandler(back_to_plan, pattern='^back_to_plan$'),
                 CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
@@ -165,16 +165,16 @@ def main():
             BotStates.SET_START_DATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_start_date),
                 CallbackQueryHandler(process_start_date, pattern='^date_'),
+                CallbackQueryHandler(request_custom_date, pattern='^date_custom$'),  # Add this
                 CallbackQueryHandler(select_project, pattern='^back_to_project$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.SELECT_PROJECT: [
                 CallbackQueryHandler(select_project, pattern=r'^project_\d+$'),
                 CallbackQueryHandler(add_employees, pattern='^add_employees$'),
-                CallbackQueryHandler(set_project_start_date, pattern='^set_start_date$'),
+                CallbackQueryHandler(set_project_start_date, pattern='^set_start_date$'),  # Add this if not present
                 CallbackQueryHandler(calculate_plan, pattern='^calculate$'),
                 CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
-                CallbackQueryHandler(back_to_project_type, pattern='^back_to_project_type$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.PREVIEW_BEFORE_EXPORT: [

@@ -47,73 +47,6 @@ def init_db():
     try:
         Base.metadata.create_all(engine)
         logger.info("База данных успешно инициализирована")
-        
-        # Проверяем, есть ли базовый проект
-        session = Session()
-        try:
-            base_project = session.query(Project).filter(Project.name == "Базовый проект").first()
-
-            if not base_project:
-                # Создаем базовый проект
-                base_project = Project(name="Базовый проект")
-                session.add(base_project)
-                session.flush()
-
-                # Создаем базовых сотрудников
-                default_employees = [
-                    {
-                        "name": "Иванов Иван Иванович",
-                        "position": "Технический специалист",
-                        "days_off": ["Среда", "Пятница"]
-                    },
-                    {
-                        "name": "Петров Петр Петрович",
-                        "position": "Старший технический специалист",
-                        "days_off": ["Суббота", "Воскресенье"]
-                    },
-                    {
-                        "name": "Сидоров Сидор Сидорович",
-                        "position": "Руководитель настройки",
-                        "days_off": ["Суббота", "Воскресенье"]
-                    },
-                    {
-                        "name": "Смирнова Анна Ивановна",
-                        "position": "Младший специалист",
-                        "days_off": ["Суббота", "Воскресенье"]
-                    },
-                    {
-                        "name": "Кузнецов Алексей Петрович",
-                        "position": "Старший специалист",
-                        "days_off": ["Суббота", "Воскресенье"]
-                    },
-                    {
-                        "name": "Соколова Мария Александровна",
-                        "position": "Руководитель контента",
-                        "days_off": ["Суббота", "Воскресенье"]
-                    }
-                ]
-
-                for emp_data in default_employees:
-                    employee = Employee(
-                        name=emp_data["name"],
-                        position=emp_data["position"]
-                    )
-                    session.add(employee)
-                    session.flush()
-
-                    for day in emp_data["days_off"]:
-                        day_off = DayOff(
-                            employee_id=employee.id,
-                            day=day
-                        )
-                        session.add(day_off)
-
-                session.commit()
-                logger.info("Базовые данные успешно инициализированы")
-            else:
-                logger.info("Базовые данные уже существуют")
-        finally:
-            session.close()
             
     except Exception as e:
         logger.error(f"Ошибка при инициализации базы данных: {str(e)}")
@@ -246,6 +179,11 @@ def add_project_employee(name, position, days_off, email=None, project_id=None):
             )
             session.add(day_off)
             logger.info(f"Добавлен выходной день {day} для сотрудника {employee.id}")
+
+        if project_id:
+            project = session.query(Project).get(project_id)
+            if project:
+                employee.projects.append(project)
 
         session.commit()
         return employee.id
@@ -694,14 +632,70 @@ def session_scope():
         session.close()
 
 def add_employee_to_project(employee_id, project_id):
+    """
+        Assigns an employee to a project.
+
+        Args:
+            employee_id: ID of the employee
+            project_id: ID of the project
+
+        Returns:
+            True if successful, False otherwise
+    """
     session = Session()
     try:
         employee = session.query(Employee).get(employee_id)
         project = session.query(Project).get(project_id)
+
         if employee and project and employee not in project.employees:
             project.employees.append(employee)
             session.commit()
             return True
         return False
+    finally:
+        session.close()
+
+
+def add_employee_without_project(name, position, days_off, email=None):
+    """
+    Adds an employee without associating them with any project.
+
+    Args:
+        name: Full name of the employee
+        position: Position of the employee
+        days_off: List of days off
+        email: Email of the employee (optional)
+
+    Returns:
+        ID of the created employee
+    """
+    return add_project_employee(name, position, days_off, email, project_id=None)
+
+
+def get_all_employees():
+    """
+    Gets all employees from the database.
+
+    Returns:
+        List of employee dictionaries with their information
+    """
+    session = Session()
+    try:
+        employees = session.query(Employee).all()
+        result = []
+
+        for employee in employees:
+            days_off = session.query(DayOff).filter(DayOff.employee_id == employee.id).all()
+            days_off_list = [day.day for day in days_off]
+
+            result.append({
+                'id': employee.id,
+                'name': employee.name,
+                'position': employee.position,
+                'email': employee.email,
+                'days_off': days_off_list
+            })
+
+        return result
     finally:
         session.close()

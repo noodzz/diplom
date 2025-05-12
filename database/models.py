@@ -123,6 +123,7 @@ class TaskTemplate(Base):
     position = Column(String, nullable=False)
     order = Column(Integer, nullable=False)  # Порядок задачи в шаблоне
     required_employees = Column(Integer, default=1)  # Number of required employees
+    roles_info = Column(String, nullable=True)  # Added this line
 
     project_template = relationship("ProjectTemplate", back_populates="tasks")
     dependencies = relationship(

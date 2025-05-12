@@ -40,6 +40,7 @@ def plan_actions_keyboard():
     """Клавиатура действий с планом."""
     keyboard = [
         [InlineKeyboardButton("Посмотреть информацию о проекте", callback_data="show_project_info")],
+        [InlineKeyboardButton("Экспорт информации в файл", callback_data="export_project_info")],
         [InlineKeyboardButton("Экспорт в Jira", callback_data="export_jira")],
         [InlineKeyboardButton("Назад", callback_data="back_to_employees")],
         [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
