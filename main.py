@@ -21,7 +21,8 @@ from bot.handlers import (
     get_my_id, set_project_start_date, show_project_info, back_to_tasks, back_to_dependencies, back_to_employees,
     back_to_plan,
     edit_task_description, save_task_description, preview_before_export, export_project_info_as_file, show_positions,
-    add_employee, handle_position_selection, handle_employee_selection, back_to_positions, request_custom_date
+    add_employee, handle_position_selection, handle_employee_selection, back_to_positions, request_custom_date,
+    add_tasks_handler, assign_all_employees_command, assign_all_employees_callback, show_dependencies
 )
 from bot.states import BotStates
 from config import BOT_TOKEN
@@ -99,19 +100,24 @@ def main():
             BotStates.CREATE_PROJECT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, create_project),
                 CallbackQueryHandler(select_project_type, pattern='^create_project$'),
+                CallbackQueryHandler(set_project_start_date, pattern='^set_start_date$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.ADD_TASK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task),
-                CallbackQueryHandler(add_dependencies, pattern='^next$'),
+                CallbackQueryHandler(add_tasks_handler, pattern='^add_tasks$'),
+                CallbackQueryHandler(show_dependencies, pattern='^goto_dependencies$'),
                 CallbackQueryHandler(calculate_plan, pattern='^calculate$'),
                 CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
                 CallbackQueryHandler(back_to_project_type, pattern='^back_to_project_type$'),
+                CallbackQueryHandler(select_project, pattern='^back_to_project$'),
+                CallbackQueryHandler(set_project_start_date, pattern='^set_start_date$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.ADD_DEPENDENCIES: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_dependencies),
-                CallbackQueryHandler(add_employees, pattern='^next$'),
+                CallbackQueryHandler(add_employees, pattern='^goto_employees$'),
+                CallbackQueryHandler(add_dependencies, pattern='^add_dependency$'),
                 CallbackQueryHandler(select_project, pattern=r'^project_\d+$'),
                 CallbackQueryHandler(back_to_tasks, pattern='^back_to_tasks$'),
                 CommandHandler('cancel', cancel)
@@ -165,16 +171,20 @@ def main():
             BotStates.SET_START_DATE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_start_date),
                 CallbackQueryHandler(process_start_date, pattern='^date_'),
-                CallbackQueryHandler(request_custom_date, pattern='^date_custom$'),  # Add this
+                CallbackQueryHandler(request_custom_date, pattern='^date_custom$'),
                 CallbackQueryHandler(select_project, pattern='^back_to_project$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.SELECT_PROJECT: [
                 CallbackQueryHandler(select_project, pattern=r'^project_\d+$'),
+                CallbackQueryHandler(add_tasks_handler, pattern='^add_tasks$'),
                 CallbackQueryHandler(add_employees, pattern='^add_employees$'),
-                CallbackQueryHandler(set_project_start_date, pattern='^set_start_date$'),  # Add this if not present
+                CallbackQueryHandler(assign_all_employees_callback, pattern='^assign_all_employees$'),
+                CallbackQueryHandler(set_project_start_date, pattern='^set_start_date$'),
                 CallbackQueryHandler(calculate_plan, pattern='^calculate$'),
                 CallbackQueryHandler(back_to_main, pattern='^main_menu$'),
+                CallbackQueryHandler(back_to_main, pattern='^back_to_main$'),
+                CallbackQueryHandler(select_project_type, pattern='^create_project$'),
                 CommandHandler('cancel', cancel)
             ],
             BotStates.PREVIEW_BEFORE_EXPORT: [
@@ -198,6 +208,7 @@ def main():
 
     # Команды для управления пользователями
     logger.info("Добавление команд управления пользователями...")
+    application.add_handler(CommandHandler('assign_all_employees', assign_all_employees_command))
     application.add_handler(CommandHandler('add_user', add_user))
     application.add_handler(CommandHandler('list_users', list_users))
     application.add_handler(CommandHandler('remove_user', remove_user))

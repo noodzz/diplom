@@ -3,36 +3,39 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from database.models import Base, Project, Task, TaskDependency, Employee, DayOff, ProjectTemplate, TaskTemplate, \
-    TaskTemplateDependency, AllowedUser
+    TaskTemplateDependency, AllowedUser, TaskPart
 from config import DATABASE_URL
 from logger import logger
+
 
 def fuzzy_position_match(db_position, search_position):
     """Нечеткое сопоставление должностей"""
     if not db_position or not search_position:
         return False
-        
+
     db_position_lower = db_position.lower().strip()
     search_position_lower = search_position.lower().strip()
-    
+
     # Точное соответствие
     if db_position_lower == search_position_lower:
         return True
-        
+
     # Стандартизация некоторых должностей
     variations = {
-        "старший технический специалист": ["старший тех. специалист", "ст. тех. специалист", "старший тех специалист", "ст. технический специалист"],
+        "руководитель контента": ["руководитель контента", "рук. контента", "руководитель контент"],
+        "старший технический специалист": ["старший тех. специалист", "ст. тех. специалист", "старший тех специалист",
+                                           "ст. технический специалист"],
         "технический специалист": ["тех. специалист", "тех специалист"],
         "руководитель настройки": ["руководитель сектора настройки"],
     }
-    
+
     # Проверяем вариации
     for standard, variants in variations.items():
         if search_position_lower == standard:
             return db_position_lower in variants or any(v in db_position_lower for v in variants)
         elif db_position_lower == standard:
             return search_position_lower in variants or any(v in search_position_lower for v in variants)
-    
+
     # Проверяем частичное соответствие
     return search_position_lower in db_position_lower or db_position_lower in search_position_lower
 
@@ -271,7 +274,7 @@ def get_project_data(project_id):
 
         # Get project employees
         project = session.query(Project).filter(Project.id == project_id).first()
-        employees = project.employees if project else []        
+        employees = project.employees if project else []
         employees_data = []
 
         for employee in employees:
@@ -289,10 +292,10 @@ def get_project_data(project_id):
         return {
             'id': project.id,
             'name': project.name,
+            'start_date': project.start_date,  # Возвращаем дату начала из БД
             'tasks': tasks_data,
             'employees': employees_data
         }
-
 
 def create_project_template(name, description=None):
     """
@@ -441,21 +444,123 @@ def create_project_from_template(template_id, project_name):
 
         # Create tasks for the project
         for template_task in template_tasks:
-            # Check if the template_task has required_employees attribute
+            # Check if task has multiple roles with different positions
             req_employees = getattr(template_task, 'required_employees', 1)
+            roles_info = getattr(template_task, 'roles_info', None)
+            sequential_subtasks = getattr(template_task, 'sequential_subtasks', False)
 
-            task = Task(
-                project_id=project.id,
-                name=template_task.name,
-                duration=template_task.duration,
-                position=template_task.position,
-                required_employees=req_employees
-            )
-            session.add(task)
-            session.flush()
+            # Если у задачи roles_info или required_employees > 1, создаем родительскую задачу с подзадачами
+            if roles_info or req_employees > 1:
+                # Create parent task
+                parent_task = Task(
+                    project_id=project.id,
+                    name=template_task.name,
+                    duration=template_task.duration,
+                    position='',  # Parent task has no specific position
+                    required_employees=req_employees
+                )
+                session.add(parent_task)
+                session.flush()
 
-            # Save ID mapping
-            task_id_map[template_task.id] = task.id
+                task_id_map[template_task.id] = parent_task.id
+
+                # Если есть roles_info, создаем подзадачи по этому шаблону
+                if roles_info:
+                    # Разбираем roles_info (формат: "Должность1:длительность1|Должность2:длительность2")
+                    roles = []
+                    for role_part in roles_info.split('|'):
+                        if ':' in role_part:
+                            position, role_duration = role_part.split(':')
+                            roles.append({
+                                "position": position.strip(),
+                                "duration": int(role_duration.strip())
+                            })
+
+                    # Создаем подзадачи для каждой роли
+                    subtask_ids = []  # Сохраняем IDs подзадач для создания зависимостей
+
+                    for i, role in enumerate(roles):
+                        subtask_name = f"{template_task.name} - {role['position']}"
+                        subtask = Task(
+                            project_id=project.id,
+                            name=subtask_name,
+                            duration=role['duration'],
+                            position=role['position'],
+                            required_employees=1,
+                            parent_id=parent_task.id
+                        )
+                        session.add(subtask)
+                        session.flush()
+
+                        subtask_ids.append(subtask.id)
+
+                        # Также создаем запись TaskPart
+                        task_part = TaskPart(
+                            task_id=parent_task.id,
+                            name=subtask_name,
+                            position=role['position'],
+                            duration=role['duration'],
+                            order=i + 1,
+                            required_employees=1
+                        )
+                        session.add(task_part)
+
+                    # Если подзадачи должны выполняться последовательно, добавляем зависимости между ними
+                    if sequential_subtasks and len(subtask_ids) > 1:
+                        for i in range(1, len(subtask_ids)):
+                            # Каждая следующая подзадача зависит от предыдущей
+                            task_dependency = TaskDependency(
+                                task_id=subtask_ids[i],
+                                predecessor_id=subtask_ids[i - 1]
+                            )
+                            session.add(task_dependency)
+                            logger.info(
+                                f"Создана зависимость: подзадача {subtask_ids[i]} зависит от {subtask_ids[i - 1]}")
+
+                # Если нет roles_info, но required_employees > 1, создаем подзадачи для нескольких исполнителей
+                elif req_employees > 1:
+                    # Создаем подзадачи для каждого исполнителя
+                    subtask_ids = []  # Сохраняем IDs подзадач для создания зависимостей
+
+                    for i in range(req_employees):
+                        subtask_name = f"{template_task.name} - Исполнитель {i + 1}"
+                        subtask = Task(
+                            project_id=project.id,
+                            name=subtask_name,
+                            duration=template_task.duration,
+                            position=template_task.position,
+                            required_employees=1,
+                            parent_id=parent_task.id
+                        )
+                        session.add(subtask)
+                        session.flush()
+
+                        subtask_ids.append(subtask.id)
+
+                    # Если подзадачи должны выполняться последовательно, добавляем зависимости между ними
+                    if sequential_subtasks and len(subtask_ids) > 1:
+                        for i in range(1, len(subtask_ids)):
+                            # Каждая следующая подзадача зависит от предыдущей
+                            task_dependency = TaskDependency(
+                                task_id=subtask_ids[i],
+                                predecessor_id=subtask_ids[i - 1]
+                            )
+                            session.add(task_dependency)
+                            logger.info(
+                                f"Создана зависимость: подзадача {subtask_ids[i]} зависит от {subtask_ids[i - 1]}")
+            else:
+                # Regular task without subtasks
+                task = Task(
+                    project_id=project.id,
+                    name=template_task.name,
+                    duration=template_task.duration,
+                    position=template_task.position,
+                    required_employees=req_employees
+                )
+                session.add(task)
+                session.flush()
+
+                task_id_map[template_task.id] = task.id
 
         # Add dependencies between tasks
         for template_task in template_tasks:
@@ -472,7 +577,6 @@ def create_project_from_template(template_id, project_name):
 
         session.commit()
         return project.id
-
 
 def get_user_projects(user_id=None):
     """
@@ -697,5 +801,37 @@ def get_all_employees():
             })
 
         return result
+    finally:
+        session.close()
+
+
+def set_project_start_date_in_db(project_id, start_date):
+    """
+    Устанавливает дату начала проекта в базе данных.
+
+    Args:
+        project_id: ID проекта
+        start_date: Дата начала проекта (datetime.date)
+
+    Returns:
+        bool: True если успешно, False в случае ошибки
+    """
+    session = Session()
+    try:
+        project = session.query(Project).get(project_id)
+        if not project:
+            logger.error(f"Проект с ID {project_id} не найден")
+            return False
+
+        project.start_date = start_date
+        session.commit()
+        logger.info(f"Установлена дата начала {start_date.strftime('%d.%m.%Y')} для проекта {project_id}")
+        return True
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при установке даты начала проекта: {str(e)}")
+        return False
+
     finally:
         session.close()

@@ -3,15 +3,15 @@ Function to automatically assign employees from the database to a project
 based on required positions in the project tasks.
 """
 
-from database.operations import get_employees_by_position, add_employee_to_project, Session
-from database.models import Project, Task
+from database.operations import add_employee_to_project, Session
+from database.models import Project, Task, Employee
 from logger import logger
 
 
 def auto_assign_employees_to_project(project_id):
     """
-    Automatically assigns employees from the database to a project
-    based on the positions required by the project's tasks.
+    Automatically assigns ALL employees from the database to a project
+    regardless of position requirements.
 
     Args:
         project_id: ID of the project to assign employees to
@@ -29,43 +29,27 @@ def auto_assign_employees_to_project(project_id):
             logger.error(f"Project not found: {project_id}")
             return []
 
-        # Get project tasks
-        tasks = session.query(Task).filter(Task.project_id == project_id).all()
-        if not tasks:
-            logger.info(f"No tasks found for project: {project_id}")
+        # Get ALL employees directly from the database
+        employees = session.query(Employee).all()
+
+        if not employees:
+            logger.warning("No employees found in the database")
             return []
 
-        # Get unique positions from tasks
-        required_positions = set()
-        for task in tasks:
-            if task.position:
-                required_positions.add(task.position)
+        logger.info(f"Found {len(employees)} employees in the database")
 
-            # Also check task parts if they exist (for multi-role tasks)
-            for part in task.parts:
-                if part.position:
-                    required_positions.add(part.position)
+        # Add ALL employees to the project
+        for employee in employees:
+            if employee not in project.employees:
+                project.employees.append(employee)
+                assigned_employee_ids.append(employee.id)
+                logger.info(f"Assigned employee {employee.name} (ID: {employee.id}) to project {project_id}")
 
-        logger.info(f"Required positions for project {project_id}: {required_positions}")
-
-        # Find employees for each required position
-        for position in required_positions:
-            # Get employees for this position
-            employees = get_employees_by_position(position=position)
-
-            if not employees:
-                logger.warning(f"No employees found for position: {position}")
-                continue
-
-            # Add all employees with this position to the project
-            for employee in employees:
-                # Check if employee is already assigned to avoid duplicates
-                if employee['id'] not in assigned_employee_ids:
-                    add_employee_to_project(employee['id'], project_id)
-                    assigned_employee_ids.append(employee['id'])
-                    logger.info(f"Assigned employee {employee['name']} (ID: {employee['id']}) to project {project_id}")
+        session.commit()
+        logger.info(f"Total {len(assigned_employee_ids)} employees assigned to project {project_id}")
 
     except Exception as e:
+        session.rollback()
         logger.error(f"Error auto-assigning employees to project {project_id}: {str(e)}")
         return []
 
@@ -99,3 +83,50 @@ def get_required_positions_from_csv_tasks(csv_tasks):
                     required_positions.add(role['position'])
 
     return required_positions
+
+def assign_all_employees_to_project(project_id):
+    """
+    Назначает всех сотрудников из базы данных на указанный проект.
+
+    Args:
+        project_id: ID проекта
+
+    Returns:
+        int: Количество назначенных сотрудников
+    """
+    session = Session()
+    count = 0
+
+    try:
+        # Получаем проект
+        project = session.query(Project).get(project_id)
+        if not project:
+            logger.error(f"Проект с ID {project_id} не найден")
+            return 0
+
+        # Получаем всех сотрудников
+        all_employees = session.query(Employee).all()
+        if not all_employees:
+            logger.warning("В базе данных не найдено сотрудников")
+            return 0
+
+        logger.info(f"Найдено {len(all_employees)} сотрудников для назначения на проект {project_id}")
+
+        # Назначаем каждого сотрудника на проект
+        for employee in all_employees:
+            if employee not in project.employees:
+                project.employees.append(employee)
+                count += 1
+                logger.info(f"Сотрудник {employee.name} ({employee.position}) назначен на проект {project_id}")
+
+        session.commit()
+        logger.info(f"Всего назначено {count} сотрудников на проект {project_id}")
+        return count
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при назначении сотрудников на проект: {str(e)}")
+        return 0
+
+    finally:
+        session.close()

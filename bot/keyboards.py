@@ -13,7 +13,7 @@ def task_actions_keyboard():
     """Клавиатура действий с задачами."""
     keyboard = [
         [InlineKeyboardButton("Добавить еще задачу", callback_data="add_task")],
-        [InlineKeyboardButton("Далее: Зависимости", callback_data="next")],
+        [InlineKeyboardButton("Далее: Зависимости", callback_data="goto_dependencies")],  # Изменяем callback_data
         [InlineKeyboardButton("Назад", callback_data="back_to_project")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -22,7 +22,7 @@ def dependencies_actions_keyboard():
     """Клавиатура действий с зависимостями."""
     keyboard = [
         [InlineKeyboardButton("Добавить еще зависимость", callback_data="add_dependency")],
-        [InlineKeyboardButton("Далее: Сотрудники", callback_data="next")],
+        [InlineKeyboardButton("Далее: Сотрудники", callback_data="goto_employees")],  # Изменяем callback_data
         [InlineKeyboardButton("Назад", callback_data="back_to_tasks")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -90,7 +90,7 @@ def projects_keyboard(projects):
         )])
 
     keyboard.append([InlineKeyboardButton("Создать новый проект", callback_data="create_project")])
-    keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_main")])
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_main")])  # Убедимся, что здесь "back_to_main"
 
     return InlineKeyboardMarkup(keyboard)
 

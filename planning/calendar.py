@@ -52,6 +52,11 @@ def is_parent_task(task, all_tasks):
     return False
 
 
+"""
+Полная версия функции create_calendar_plan с интегрированными изменениями
+"""
+
+
 def create_calendar_plan(network_parameters, project_data, start_date=None):
     """
     Создает календарный план с учетом выходных дней сотрудников.
@@ -116,6 +121,267 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     # Создаем словарь для быстрого доступа к задачам
     network_by_id = {task['id']: task for task in optimized_network}
 
+    # --- НОВЫЙ КОД: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПОДЗАДАЧ ---
+    def find_earliest_available_date(employee_id, after_date, employee_schedule, days_off_map):
+        """
+        Находит самую раннюю дату, когда сотрудник доступен после указанной даты.
+        """
+        current_date = after_date
+        days_off = days_off_map.get(employee_id, [])
+
+        # Пропускаем выходные дни
+        while current_date.weekday() in days_off:
+            current_date += timedelta(days=1)
+
+        # Проверяем существующие задачи сотрудника
+        for task in sorted(employee_schedule.get(employee_id, []), key=lambda x: x['end_date']):
+            # Если текущая дата попадает в интервал задачи, передвигаем на день после окончания
+            if task['start_date'] <= current_date <= task['end_date']:
+                current_date = task['end_date'] + timedelta(days=1)
+                # И снова пропускаем выходные
+                while current_date.weekday() in days_off:
+                    current_date += timedelta(days=1)
+
+        return current_date
+
+    def calculate_task_end_date_with_constraints(start_date, duration, days_off, max_end_date):
+        """
+        Вычисляет дату окончания задачи с учетом ограничения по максимальной дате окончания.
+        """
+        working_days = 0
+        current_date = start_date
+
+        while working_days < duration:
+            if current_date.weekday() not in days_off:
+                working_days += 1
+
+            if working_days < duration:
+                current_date += timedelta(days=1)
+
+            # Проверяем, не превысили ли максимальную дату
+            if current_date > max_end_date:
+                return None
+
+        return current_date
+
+    def assign_subtasks_within_parent_constraints(task, parent_start_date, parent_end_date, position_employee_map,
+                                                  employee_schedule, days_off_map, start_date):
+        """
+        Назначает подзадачи так, чтобы они укладывались в сроки родительской задачи.
+        """
+        position = task.get('position', '')
+
+        # Получаем сотрудников для данной должности
+        available_employees = position_employee_map.get(position, [])
+        if not available_employees:
+            logger.warning(f"No employees found for position {position} for subtask {task['name']}")
+            return False, None, None, None
+
+        logger.info(f"Looking for employees with position {position} for task {task['name']}")
+
+        # Перебираем всех сотрудников в поисках того, кто может выполнить задачу в рамках родительской
+        for employee in available_employees:
+            # Проверяем, когда сотрудник может начать задачу (не раньше parent_start_date)
+            earliest_possible_start = max(
+                parent_start_date,
+                find_earliest_available_date(employee['id'], parent_start_date, employee_schedule, days_off_map)
+            )
+
+            # Проверяем, сможет ли сотрудник закончить до parent_end_date
+            task_end_date = calculate_task_end_date_with_constraints(
+                earliest_possible_start,
+                task['duration'],
+                days_off_map.get(employee['id'], []),
+                parent_end_date
+            )
+
+            # Если task_end_date <= parent_end_date, значит сотрудник может выполнить задачу вовремя
+            if task_end_date and task_end_date <= parent_end_date:
+                logger.info(f"Found employee {employee['name']} for task {task['name']} to fit parent constraints")
+                return True, earliest_possible_start, task_end_date, employee['id']
+
+        # Если не нашли подходящего сотрудника, ищем самого раннего доступного
+        logger.warning(f"Could not find employee to fit task {task['name']} within parent constraints")
+
+        # Берем первого доступного сотрудника и назначаем как можно раньше
+        if available_employees:
+            employee = available_employees[0]
+            earliest_start = find_earliest_available_date(
+                employee['id'], parent_start_date, employee_schedule, days_off_map
+            )
+            task_end_date = calculate_task_end_date(
+                earliest_start, task['duration'], days_off_map.get(employee['id'], [])
+            )
+
+            logger.info(
+                f"Using employee {employee['name']} for task {task['name']} even though it exceeds parent constraints")
+            return False, earliest_start, task_end_date, employee['id']
+
+        return False, None, None, None
+
+    # --- НАЧАЛО ОСНОВНОГО КОДА ФУНКЦИИ ---
+
+    # Обрабатываем родительские задачи отдельно
+    parent_tasks = {}
+    parent_subtasks = {}
+
+    # Находим все родительские задачи
+    for task in optimized_network:
+        if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
+            task_start_date = start_date + timedelta(days=task.get('early_start', 0))
+            task_end_date = start_date + timedelta(days=task.get('early_finish', 0))
+
+            parent_task = {
+                'id': task['id'],
+                'name': task['name'],
+                'start_date': task_start_date,
+                'end_date': task_end_date,
+                'duration': task['duration'],
+                'is_critical': task.get('is_critical', False),
+                'reserve': task.get('reserve', 0),
+                'employee': None,
+                'employee_email': None,
+                'position': '',
+                'is_parent': True
+            }
+
+            parent_tasks[task['id']] = parent_task
+            parent_subtasks[task['id']] = []
+
+            # Добавляем в календарный план
+            calendar_plan['tasks'].append(parent_task)
+
+    # Находим подзадачи для каждой родительской задачи
+    for task in optimized_network:
+        # Пропускаем родительские задачи
+        if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
+            continue
+
+        # Ищем, является ли задача подзадачей по имени
+        task_name = task.get('name', '')
+        if ' - ' in task_name:
+            parent_name = task_name.split(' - ')[0]
+
+            # Ищем родительскую задачу по имени
+            parent_id = None
+            for pid, parent in parent_tasks.items():
+                if parent['name'] == parent_name:
+                    parent_id = pid
+                    break
+
+            # Если нашли родительскую задачу, добавляем к её подзадачам
+            if parent_id:
+                parent_subtasks[parent_id].append(task)
+                continue
+
+    # Теперь обрабатываем подзадачи для каждой родительской задачи
+    for parent_id, subtasks in parent_subtasks.items():
+        parent = parent_tasks[parent_id]
+
+        # Если у родительской задачи есть подзадачи, назначаем их
+        if subtasks:
+            logger.info(f"Assigning {len(subtasks)} subtasks for parent task '{parent['name']}'")
+
+            # Проходим по каждой подзадаче и пытаемся назначить в рамках родительской
+            for subtask in subtasks:
+                success, task_start, task_end, employee_id = assign_subtasks_within_parent_constraints(
+                    subtask,
+                    parent['start_date'],
+                    parent['end_date'],
+                    position_employee_map,
+                    employee_schedule,
+                    days_off_map,
+                    start_date
+                )
+
+                if success:
+                    employee = next((e for e in employees if e['id'] == employee_id), None)
+
+                    if employee:
+                        # Добавляем задачу в расписание сотрудника
+                        if employee_id not in employee_schedule:
+                            employee_schedule[employee_id] = []
+
+                        employee_schedule[employee_id].append({
+                            'task_id': subtask['id'],
+                            'start_date': task_start,
+                            'end_date': task_end
+                        })
+
+                        # Обновляем нагрузку сотрудника
+                        employee_workload[employee_id] = employee_workload.get(employee_id, 0) + subtask['duration']
+
+                        # Добавляем подзадачу в календарный план
+                        calendar_plan['tasks'].append({
+                            'id': subtask['id'],
+                            'name': subtask['name'],
+                            'start_date': task_start,
+                            'end_date': task_end,
+                            'duration': subtask['duration'],
+                            'is_critical': subtask.get('is_critical', False),
+                            'reserve': subtask.get('reserve', 0),
+                            'employee': employee['name'],
+                            'employee_email': employee.get('email', ''),
+                            'position': subtask.get('position', ''),
+                            'is_subtask': True,
+                            'parent_task_id': parent_id
+                        })
+
+                        logger.info(
+                            f"Assigned subtask '{subtask['name']}' to {employee['name']} within parent constraints")
+                else:
+                    # Если не удалось назначить подзадачу в рамках родительской
+                    if task_start and task_end and employee_id:
+                        # Назначаем подзадачу вне рамок, но предупреждаем
+                        employee = next((e for e in employees if e['id'] == employee_id), None)
+
+                        if employee:
+                            # Добавляем задачу в расписание сотрудника
+                            if employee_id not in employee_schedule:
+                                employee_schedule[employee_id] = []
+
+                            employee_schedule[employee_id].append({
+                                'task_id': subtask['id'],
+                                'start_date': task_start,
+                                'end_date': task_end
+                            })
+
+                            # Обновляем нагрузку сотрудника
+                            employee_workload[employee_id] = employee_workload.get(employee_id, 0) + subtask['duration']
+
+                            # Добавляем подзадачу в календарный план
+                            calendar_plan['tasks'].append({
+                                'id': subtask['id'],
+                                'name': subtask['name'],
+                                'start_date': task_start,
+                                'end_date': task_end,
+                                'duration': subtask['duration'],
+                                'is_critical': subtask.get('is_critical', False),
+                                'reserve': subtask.get('reserve', 0),
+                                'employee': employee['name'],
+                                'employee_email': employee.get('email', ''),
+                                'position': subtask.get('position', ''),
+                                'is_subtask': True,
+                                'parent_task_id': parent_id
+                            })
+
+                            logger.warning(
+                                f"Could not fit subtask '{subtask['name']}' within parent constraints, assigned anyway")
+
+                            # Расширяем родительскую задачу, если подзадача выходит за её рамки
+                            if task_start < parent['start_date']:
+                                parent['start_date'] = task_start
+                            if task_end > parent['end_date']:
+                                parent['end_date'] = task_end
+
+                            # Обновляем длительность родительской задачи
+                            parent['duration'] = (parent['end_date'] - parent['start_date']).days + 1
+                    else:
+                        logger.error(f"Failed to assign subtask '{subtask['name']}' at all")
+
+    # Пропускаем подзадачи при обработке основных задач
+    skip_tasks = set(task['id'] for tasks in parent_subtasks.values() for task in tasks)
+
     # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: сначала обрабатываем критический путь, потом остальные задачи
     critical_task_ids = [task['id'] for task in critical_path]
 
@@ -127,31 +393,15 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     # 1. Сначала обрабатываем критические задачи
     current_date = start_date
     for task in critical_tasks:
-        position = task.get('position', '')
-
-        # ИЗМЕНЕНИЕ: Проверяем, является ли задача родительской
-        if task.get('is_parent', False):
-            # Для родительской задачи не назначаем исполнителя
-            task_start_date = current_date
-            task_end_date = task_start_date + timedelta(days=task['duration'] - 1)
-
-            calendar_plan['tasks'].append({
-                'id': task['id'],
-                'name': task['name'],
-                'start_date': task_start_date,
-                'end_date': task_end_date,
-                'duration': task['duration'],
-                'is_critical': True,
-                'reserve': 0,
-                'employee': None,  # Нет исполнителя для родительской задачи
-                'employee_email': None,
-                'position': '',  # Очищаем позицию для родительской задачи
-                'is_parent': True
-            })
-
-            # Обновляем дату для следующей задачи
-            current_date = task_end_date + timedelta(days=1)
+        # Пропускаем задачи, которые уже обработаны как подзадачи
+        if task['id'] in skip_tasks:
             continue
+
+        # Пропускаем родительские задачи, которые уже обработаны выше
+        if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
+            continue
+
+        position = task.get('position', '')
 
         # Если у задачи есть назначенный сотрудник из оптимизации
         if 'assigned_employee_id' in task:
@@ -211,30 +461,16 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
 
     # 2. Затем обрабатываем остальные задачи
     for task in non_critical_tasks:
+        # Пропускаем задачи, которые уже обработаны как подзадачи
+        if task['id'] in skip_tasks:
+            continue
+
+        # Пропускаем родительские задачи, которые уже обработаны выше
+        if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
+            continue
+
         position = task.get('position', '')
         required_employees = task.get('required_employees', 1)
-
-        # ИЗМЕНЕНИЕ: Проверяем, является ли задача родительской
-        if task.get('is_parent', False):
-            # Определяем даты начала и окончания для родительской задачи
-            # Можно использовать ранний старт и ранний финиш из сетевой модели
-            task_start_date = start_date + timedelta(days=task.get('early_start', 0))
-            task_end_date = start_date + timedelta(days=task.get('early_finish', 0))
-
-            calendar_plan['tasks'].append({
-                'id': task['id'],
-                'name': task['name'],
-                'start_date': task_start_date,
-                'end_date': task_end_date,
-                'duration': task['duration'],
-                'is_critical': False,
-                'reserve': task.get('reserve', 0),
-                'employee': None,  # Нет исполнителя для родительской задачи
-                'employee_email': None,
-                'position': '',  # Очищаем позицию для родительской задачи
-                'is_parent': True
-            })
-            continue
 
         # Обрабатываем задачи с одним исполнителем
         if required_employees == 1:
@@ -320,9 +556,6 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                         'employee_email': employee.get('email', ''),
                         'position': position
                     })
-
-        # Обрабатываем групповые задачи (требуется несколько исполнителей) - эти уже отмечены как is_parent
-        # Этот блок можно оставить, но он не должен выполняться из-за проверки выше
 
     # Проверяем, все ли задачи включены в план
     critical_task_names = set(calendar_plan['critical_path'])
@@ -963,3 +1196,133 @@ def ensure_tasks_included(network_parameters, calendar_plan, start_date):
 
     logger.info(f"Всего добавлено задач: {tasks_added}")
     return calendar_plan
+
+# Эта функция будет пытаться назначить подзадачи так, чтобы они уложились в сроки родительской задачи
+def assign_subtasks_within_parent_constraints(task, parent_start_date, parent_end_date, position_employee_map,
+                                              employee_schedule, days_off_map, start_date):
+    """
+    Назначает подзадачи так, чтобы они укладывались в сроки родительской задачи.
+
+    Args:
+        task: Подзадача для назначения
+        parent_start_date: Дата начала родительской задачи
+        parent_end_date: Дата окончания родительской задачи
+        position_employee_map: Словарь {должность: список сотрудников}
+        employee_schedule: Расписание сотрудников
+        days_off_map: Словарь выходных дней
+        start_date: Дата начала проекта
+
+    Returns:
+        Tuple: (success, task_start_date, task_end_date, assigned_employee_id)
+    """
+    position = task.get('position', '')
+
+    # Получаем сотрудников для данной должности
+    available_employees = position_employee_map.get(position, [])
+    if not available_employees:
+        logger.warning(f"No employees found for position {position} for subtask {task['name']}")
+        return False, None, None, None
+
+    logger.info(f"Looking for employees with position {position} for task {task['name']}")
+
+    # Перебираем всех сотрудников в поисках того, кто может выполнить задачу в рамках родительской
+    for employee in available_employees:
+        # Проверяем, когда сотрудник может начать задачу (не раньше parent_start_date)
+        earliest_possible_start = max(
+            parent_start_date,
+            find_earliest_available_date(employee['id'], parent_start_date, employee_schedule, days_off_map)
+        )
+
+        # Проверяем, сможет ли сотрудник закончить до parent_end_date
+        task_end_date = calculate_task_end_date_with_constraints(
+            earliest_possible_start,
+            task['duration'],
+            days_off_map.get(employee['id'], []),
+            parent_end_date
+        )
+
+        # Если task_end_date <= parent_end_date, значит сотрудник может выполнить задачу вовремя
+        if task_end_date and task_end_date <= parent_end_date:
+            logger.info(f"Found employee {employee['name']} for task {task['name']} to fit parent constraints")
+            return True, earliest_possible_start, task_end_date, employee['id']
+
+    # Если не нашли подходящего сотрудника, ищем самого раннего доступного
+    logger.warning(f"Could not find employee to fit task {task['name']} within parent constraints")
+
+    # Берем первого доступного сотрудника и назначаем как можно раньше
+    if available_employees:
+        employee = available_employees[0]
+        earliest_start = find_earliest_available_date(
+            employee['id'], parent_start_date, employee_schedule, days_off_map
+        )
+        task_end_date = calculate_task_end_date(
+            earliest_start, task['duration'], days_off_map.get(employee['id'], [])
+        )
+
+        logger.info(
+            f"Using employee {employee['name']} for task {task['name']} even though it exceeds parent constraints")
+        return False, earliest_start, task_end_date, employee['id']
+
+    return False, None, None, None
+
+
+def find_earliest_available_date(employee_id, after_date, employee_schedule, days_off_map):
+    """
+    Находит самую раннюю дату, когда сотрудник доступен после указанной даты.
+
+    Args:
+        employee_id: ID сотрудника
+        after_date: Дата, после которой искать доступность
+        employee_schedule: Расписание сотрудников
+        days_off_map: Словарь выходных дней
+
+    Returns:
+        datetime: Самая ранняя доступная дата
+    """
+    current_date = after_date
+    days_off = days_off_map.get(employee_id, [])
+
+    # Пропускаем выходные дни
+    while current_date.weekday() in days_off:
+        current_date += timedelta(days=1)
+
+    # Проверяем существующие задачи сотрудника
+    for task in sorted(employee_schedule.get(employee_id, []), key=lambda x: x['end_date']):
+        # Если текущая дата попадает в интервал задачи, передвигаем на день после окончания
+        if task['start_date'] <= current_date <= task['end_date']:
+            current_date = task['end_date'] + timedelta(days=1)
+            # И снова пропускаем выходные
+            while current_date.weekday() in days_off:
+                current_date += timedelta(days=1)
+
+    return current_date
+
+
+def calculate_task_end_date_with_constraints(start_date, duration, days_off, max_end_date):
+    """
+    Вычисляет дату окончания задачи с учетом ограничения по максимальной дате окончания.
+
+    Args:
+        start_date: Дата начала задачи
+        duration: Длительность задачи в рабочих днях
+        days_off: Список выходных дней сотрудника
+        max_end_date: Максимальная дата окончания
+
+    Returns:
+        datetime: Дата окончания задачи или None, если невозможно уложиться в ограничение
+    """
+    working_days = 0
+    current_date = start_date
+
+    while working_days < duration:
+        if current_date.weekday() not in days_off:
+            working_days += 1
+
+        if working_days < duration:
+            current_date += timedelta(days=1)
+
+        # Проверяем, не превысили ли максимальную дату
+        if current_date > max_end_date:
+            return None
+
+    return current_date

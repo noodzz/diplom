@@ -140,7 +140,7 @@ async def select_template(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler for setting project start date."""
     query = update.callback_query
-    logger.info("set_project_start_date handler called")
+    logger.info("set_project_start_date handler called with callback_data: %s", query.data)
     await query.answer()
 
     # Update the message to ask for a start date
@@ -170,6 +170,7 @@ async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_T
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         logger.info("Date selection message sent successfully")
+        return BotStates.SET_START_DATE
     except Exception as e:
         logger.error(f"Error in set_project_start_date: {str(e)}")
         # Fallback message if there's an error
@@ -179,9 +180,7 @@ async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_T
                 [InlineKeyboardButton("Отмена", callback_data="back_to_project")]
             ])
         )
-
-    return BotStates.SET_START_DATE
-
+        return BotStates.ADD_TASK
 
 async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process the start date input from user."""
@@ -217,21 +216,37 @@ async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Store the date in context
         context.user_data['project_start_date'] = start_date
 
-        # Return to project view with confirmation
+        # Save the date to database
         project_id = context.user_data.get('current_project_id')
         if project_id:
-            await show_project_with_message(
-                query,
-                context,
-                project_id,
-                f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}"
-            )
+            # Import function from database.operations
+            from database.operations import set_project_start_date_in_db
+            success = set_project_start_date_in_db(project_id, start_date.date())
+
+            if success:
+                # Вместо BotStates.ADD_TASK возвращаем SELECT_PROJECT для правильной обработки кнопок
+                return await show_project_with_message(
+                    query,
+                    context,
+                    project_id,
+                    f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}"
+                )
+            else:
+                await query.edit_message_text(
+                    f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}\n"
+                    "⚠️ Возникла ошибка при сохранении даты в базе данных.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")]
+                    ])
+                )
+                # Возвращаем состояние SELECT_PROJECT
+                return BotStates.SELECT_PROJECT
         else:
             await query.edit_message_text(
                 f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}",
                 reply_markup=main_menu_keyboard()
             )
-        return BotStates.ADD_TASK
+            return BotStates.MAIN_MENU
 
     # Handle text input for custom date
     text = update.message.text.strip()
@@ -253,15 +268,22 @@ async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Store the date in context
         context.user_data['project_start_date'] = start_date
 
+        # Save the date to database
+        project_id = context.user_data.get('current_project_id')
+        if project_id:
+            # Import function from database.operations
+            from database.operations import set_project_start_date_in_db
+            set_project_start_date_in_db(project_id, start_date.date())
+
         # Confirm the date setting
         await update.message.reply_text(
             f"Дата начала проекта установлена: {start_date.strftime('%d.%m.%Y')}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
                 [InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")]
             ])
         )
-        return BotStates.ADD_TASK
+        # Возвращаем состояние SELECT_PROJECT вместо ADD_TASK
+        return BotStates.SELECT_PROJECT
 
     except (ValueError, IndexError):
         # Handle invalid date format
@@ -273,6 +295,7 @@ async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ])
         )
         return BotStates.SET_START_DATE
+
 
 async def show_project_with_message(query, context, project_id, message):
     """Show project details with a message."""
@@ -289,12 +312,26 @@ async def show_project_with_message(query, context, project_id, message):
     # Format project information with the message
     project_info = format_project_info(project_data, context)
 
-    await query.edit_message_text(
-        f"{message}\n\n{project_info}",
-        reply_markup=get_project_keyboard(project_data),
-        parse_mode='Markdown'
-    )
-    return BotStates.ADD_TASK
+    # Создаем клавиатуру для проекта
+    keyboard = get_project_keyboard(project_data)
+
+    try:
+        await query.edit_message_text(
+            f"{message}\n\n{project_info}",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+        logger.info(f"Сообщение с информацией о проекте после установки даты отправлено успешно")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения о проекте: {str(e)}")
+        # В случае ошибки отправляем новое сообщение
+        await query.message.reply_text(
+            f"{message}\n\n{project_info}",
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
+
+    return BotStates.SELECT_PROJECT
 
 
 def format_project_info(project_data, context):
@@ -302,10 +339,21 @@ def format_project_info(project_data, context):
     # Basic project info
     message = f"📊 *Проект: {project_data['name']}*\n\n"
 
-    # Add start date if set
-    start_date = context.user_data.get('project_start_date')
+    # Сначала пробуем взять дату из БД
+    start_date = project_data.get('start_date')
+
+    # Если даты нет в БД, пробуем взять из контекста
+    if not start_date and 'project_start_date' in context.user_data:
+        start_date = context.user_data['project_start_date']
+
+    # Отображаем дату, если она есть
     if start_date:
-        message += f"*Дата начала:* {start_date.strftime('%d.%m.%Y')}\n\n"
+        # Конвертируем datetime.date в строку, если это объект date
+        if hasattr(start_date, 'strftime'):
+            date_str = start_date.strftime('%d.%m.%Y')
+        else:
+            date_str = str(start_date)
+        message += f"*Дата начала:* {date_str}\n\n"
 
     # Information about tasks
     message += f"*Задачи:* {len(project_data['tasks'])}\n\n"
@@ -333,6 +381,7 @@ def get_project_keyboard(project_data):
     keyboard = [
         [InlineKeyboardButton("Добавить задачи", callback_data="add_tasks")],
         [InlineKeyboardButton("Добавить сотрудников", callback_data="add_employees")],
+        [InlineKeyboardButton("Назначить всех сотрудников", callback_data="assign_all_employees")],  # Новая кнопка
         [InlineKeyboardButton("Установить дату начала", callback_data="set_start_date")],
         [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
         [InlineKeyboardButton("Назад к списку проектов", callback_data="list_projects")],
@@ -487,6 +536,25 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик добавления задачи."""
+    # Check if this is a callback query
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+
+        # Handle callback - might be navigational
+        if query.data == "add_task":
+            await query.edit_message_text(
+                "Добавьте информацию о задаче в формате:\n"
+                "<название задачи> | <длительность в днях> | <должность исполнителя>\n\n"
+                "Например: Создание тарифов обучения | 1 | Технический специалист",
+                reply_markup=task_actions_keyboard()
+            )
+        return BotStates.ADD_TASK
+
+    # If we have a text message with task details
+    if not update.message or not update.message.text:
+        logger.error("Получен пустой текст сообщения в add_task")
+        return BotStates.ADD_TASK
     task_data = update.message.text.split('|')
 
     if len(task_data) != 3:
@@ -524,33 +592,80 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return BotStates.ADD_TASK
 
-
 async def add_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик добавления зависимостей между задачами."""
-    query = update.callback_query
+    logger.info(
+        f"add_dependencies handler called, update type: {'callback_query' if update.callback_query else 'message'}")
 
-    if query and query.data == 'next':
+    # Обработка callback_query (нажатие на кнопку)
+    if update.callback_query:
+        query = update.callback_query
         await query.answer()
-        await safe_edit_message_text(
-            query,
-            f"Укажите зависимости между задачами.\n\n{ADD_DEPENDENCIES_PROMPT}"
-        )
-        # Отправляем список задач для удобства
-        tasks_text = "Список задач:\n"
-        for idx, task in enumerate(context.user_data['tasks']):
-            tasks_text += f"{idx + 1}. {task['name']}\n"
 
-        await query.message.reply_text(tasks_text)
+        if query.data == 'next':
+            logger.info("'Далее: Сотрудники' button pressed, redirecting to ADD_EMPLOYEES state")
+
+            # Получаем данные проекта для отображения информации о сотрудниках
+            project_id = context.user_data.get('current_project_id')
+            if not project_id:
+                logger.error("Project ID not found in context")
+                await query.edit_message_text(
+                    "Ошибка: не найден ID проекта. Пожалуйста, выберите проект заново.",
+                    reply_markup=main_menu_keyboard()
+                )
+                return BotStates.MAIN_MENU
+
+            project_data = get_project_data(project_id)
+
+            # Формируем сообщение о существующих сотрудниках
+            employees_text = ""
+            if project_data and project_data.get('employees'):
+                employees = project_data['employees']
+                employees_text = "Существующие сотрудники:\n"
+                for idx, employee in enumerate(employees, 1):
+                    days_off_str = ", ".join(employee.get('days_off', [])) if employee.get(
+                        'days_off') else "Без выходных"
+                    employees_text += f"{idx}. {employee['name']} | {employee['position']} | {days_off_str}\n"
+                employees_text += "\n"
+
+            try:
+                await query.edit_message_text(
+                    f"{employees_text}Добавьте информацию о сотруднике в формате:\n"
+                    "<ФИО> | <должность> | <выходные дни через запятую>\n\n"
+                    "Например: Иванов Иван Иванович | Технический специалист | Суббота, Воскресенье",
+                    reply_markup=employees_actions_keyboard()
+                )
+                logger.info("Successfully redirected to ADD_EMPLOYEES state")
+                return BotStates.ADD_EMPLOYEES
+            except Exception as e:
+                logger.error(f"Error editing message: {str(e)}")
+                # Если редактирование не удалось, отправляем новое сообщение
+                await query.message.reply_text(
+                    f"{employees_text}Добавьте информацию о сотруднике в формате:\n"
+                    "<ФИО> | <должность> | <выходные дни через запятую>\n\n"
+                    "Например: Иванов Иван Иванович | Технический специалист | Суббота, Воскресенье",
+                    reply_markup=employees_actions_keyboard()
+                )
+                return BotStates.ADD_EMPLOYEES
+
+        elif query.data == 'back_to_tasks':
+            logger.info("Back button pressed, returning to ADD_TASK state")
+            return await back_to_tasks(update, context)
+
+        # Другие callback_data обработчики...
+
         return BotStates.ADD_DEPENDENCIES
 
-    # Если пришел текст с зависимостями
-    if not update.message.text:
+    # Обработка текстового сообщения с зависимостями
+    if not update.message or not update.message.text:
+        logger.warning("Invalid message format received")
         await update.message.reply_text(
             f"Неверный формат. Пожалуйста, используйте формат:\n{ADD_DEPENDENCIES_PROMPT}"
         )
         return BotStates.ADD_DEPENDENCIES
 
     if '|' not in update.message.text:
+        logger.info("No dependencies specified, showing next button")
         await update.message.reply_text(
             "Не указаны зависимости для задачи. Переходим к следующему этапу.",
             reply_markup=dependencies_actions_keyboard()
@@ -562,12 +677,13 @@ async def add_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Находим задачу по имени
     task_id = None
-    for task in context.user_data['tasks']:
+    for task in context.user_data.get('tasks', []):
         if task['name'] == task_name:
             task_id = task['id']
             break
 
     if not task_id:
+        logger.warning(f"Task not found: {task_name}")
         await update.message.reply_text(f"Задача '{task_name}' не найдена. Попробуйте снова.")
         return BotStates.ADD_DEPENDENCIES
 
@@ -586,13 +702,13 @@ async def add_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Добавляем зависимости в БД
         for pred_id in predecessor_ids:
             add_task_dependencies(task_id, pred_id)
+            logger.info(f"Added dependency: Task {task_id} depends on {pred_id}")
 
     await update.message.reply_text(
         f"Зависимости для задачи '{task_name}' добавлены. Добавьте еще зависимости или перейдите к добавлению сотрудников.",
         reply_markup=dependencies_actions_keyboard()
     )
     return BotStates.ADD_DEPENDENCIES
-
 
 async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Начало обработки add_employees")
@@ -786,8 +902,28 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Calculate network parameters
     network_parameters = calculate_network_parameters(project_data)
 
-    # Get start date from context or use today's date
-    start_date = context.user_data.get('project_start_date')
+    # Приоритет получения даты начала:
+    # 1. Из БД проекта
+    # 2. Из контекста
+    # 3. Сегодняшняя дата
+
+    start_date = None
+
+    # Попытка получить дату из БД
+    if project_data.get('start_date'):
+        db_date = project_data['start_date']
+        # Если это date, конвертируем в datetime
+        if hasattr(db_date, 'year'):  # Проверяем, является ли объектом date или datetime
+            from datetime import datetime
+            start_date = datetime.combine(db_date, datetime.min.time())
+            logger.info(f"Using project start date from database: {start_date}")
+
+    # Если нет даты в БД, смотрим в контекст
+    if not start_date and 'project_start_date' in context.user_data:
+        start_date = context.user_data['project_start_date']
+        logger.info(f"Using project start date from context: {start_date}")
+
+    # Если все еще нет даты, используем сегодняшнюю
     if not start_date:
         # Set default to today
         start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -897,6 +1033,7 @@ async def export_to_jira(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик просмотра списка проектов."""
+    logger.info("list_projects handler called")
     query = update.callback_query
     await query.answer()
 
@@ -912,7 +1049,7 @@ async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "У вас пока нет проектов. Вы можете создать новый проект.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Создать проект", callback_data="create_project"),
-                InlineKeyboardButton("Вернуться в меню", callback_data="main_menu")
+                InlineKeyboardButton("Вернуться в меню", callback_data="back_to_main")
             ]])
         )
         return BotStates.MAIN_MENU
@@ -937,7 +1074,6 @@ async def list_projects(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     return BotStates.SELECT_PROJECT
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет текущую операцию и возвращает в главное меню."""
@@ -968,13 +1104,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик возврата в главное меню."""
+    logger.info("back_to_main handler called")
     query = update.callback_query
     await query.answer()
 
-    await query.edit_message_text(
-        WELCOME_MESSAGE,
-        reply_markup=main_menu_keyboard()
-    )
+    try:
+        await query.edit_message_text(
+            WELCOME_MESSAGE,
+            reply_markup=main_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Error in back_to_main: {str(e)}")
+        # В случае ошибки отправляем новое сообщение
+        await query.message.reply_text(
+            WELCOME_MESSAGE,
+            reply_markup=main_menu_keyboard()
+        )
 
     return BotStates.MAIN_MENU
 
@@ -2252,3 +2397,187 @@ async def request_custom_date(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data['awaiting_custom_date'] = True
     return BotStates.SET_START_DATE
+
+
+async def add_tasks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для кнопки 'Добавить задачи'."""
+    logger.info("Начало обработки add_tasks_handler")
+    query = update.callback_query
+    await query.answer()
+
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        logger.error("ID проекта не найден в контексте")
+        await query.edit_message_text(
+            "Ошибка: проект не выбран. Пожалуйста, выберите проект заново.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Загружаем существующие задачи
+    project_data = get_project_data(project_id)
+    logger.info(f"Найдено задач: {len(project_data['tasks']) if project_data and 'tasks' in project_data else 0}")
+
+    # Формируем сообщение
+    tasks_text = ""
+    if project_data and project_data['tasks']:
+        tasks_text = "Существующие задачи:\n"
+        for idx, task in enumerate(
+                project_data['tasks'][:10]):  # Ограничиваем 10 задачами для предотвращения слишком длинного сообщения
+            tasks_text += f"{idx + 1}. {task['name']} ({task['duration']} дн.) - {task['position']}\n"
+
+        if len(project_data['tasks']) > 10:
+            tasks_text += f"...и еще {len(project_data['tasks']) - 10} задач\n"
+
+        tasks_text += "\n"
+
+    try:
+        await query.edit_message_text(
+            f"{tasks_text}Добавьте информацию о задаче в формате:\n"
+            "<название задачи> | <длительность в днях> | <должность исполнителя>\n\n"
+            "Например: Создание тарифов обучения | 1 | Технический специалист",
+            reply_markup=task_actions_keyboard()
+        )
+        logger.info("Сообщение с информацией о задачах отправлено")
+        return BotStates.ADD_TASK
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения: {str(e)}")
+        # В случае ошибки отправляем новое сообщение вместо редактирования
+        await query.message.reply_text(
+            "Добавьте информацию о задаче в формате:\n"
+            "<название задачи> | <длительность в днях> | <должность исполнителя>\n\n"
+            "Например: Создание тарифов обучения | 1 | Технический специалист",
+            reply_markup=task_actions_keyboard()
+        )
+        return BotStates.ADD_TASK
+
+
+async def assign_all_employees_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик команды для назначения всех сотрудников на текущий проект.
+
+    Использование: /assign_all_employees
+    """
+    from utils.employee_assignment import assign_all_employees_to_project
+
+    # Проверяем, выбран ли проект
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await update.message.reply_text(
+            "Сначала выберите проект с помощью команды /list_projects"
+        )
+        return
+
+    # Назначаем всех сотрудников
+    count = assign_all_employees_to_project(project_id)
+
+    if count > 0:
+        await update.message.reply_text(
+            f"Успешно назначено {count} сотрудников на текущий проект.\n"
+            "Теперь вы можете пересчитать календарный план."
+        )
+    else:
+        await update.message.reply_text(
+            "Не удалось назначить сотрудников на проект. Проверьте лог ошибок."
+        )
+
+
+async def assign_all_employees_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик кнопки для назначения всех сотрудников на текущий проект.
+    """
+    from utils.employee_assignment import assign_all_employees_to_project
+
+    query = update.callback_query
+    await query.answer()
+
+    # Проверяем, выбран ли проект
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await query.edit_message_text(
+            "Ошибка: проект не выбран. Пожалуйста, выберите проект заново.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Назначаем всех сотрудников
+    count = assign_all_employees_to_project(project_id)
+
+    if count > 0:
+        # Получаем обновленные данные проекта
+        project_data = get_project_data(project_id)
+
+        # Формируем сообщение об успешном назначении
+        message = f"✅ Успешно назначено {count} сотрудников на проект.\n\n"
+        message += format_project_info(project_data, context)
+
+        await query.edit_message_text(
+            message,
+            reply_markup=get_project_keyboard(project_data),
+            parse_mode='Markdown'
+        )
+    else:
+        await query.edit_message_text(
+            "❌ Не удалось назначить сотрудников на проект. Проверьте лог ошибок.",
+            reply_markup=get_project_keyboard(get_project_data(project_id)),
+            parse_mode='Markdown'
+        )
+
+    return BotStates.SELECT_PROJECT
+
+
+async def show_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик для перехода к добавлению зависимостей.
+    """
+    logger.info("show_dependencies handler called")
+    query = update.callback_query
+    await query.answer()
+
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        logger.error("Project ID not found in context")
+        await query.edit_message_text(
+            "Ошибка: не найден ID проекта. Пожалуйста, выберите проект заново.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Получаем задачи проекта для отображения
+    project_data = get_project_data(project_id)
+
+    if not project_data or not project_data['tasks']:
+        logger.warning("No tasks found for dependencies")
+        await query.edit_message_text(
+            "В проекте нет задач для добавления зависимостей. Сначала добавьте задачи.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")]
+            ])
+        )
+        return BotStates.SELECT_PROJECT
+
+    # Создаем сообщение с инструкцией и списком задач
+    message = "Укажите зависимости между задачами в формате:\n"
+    message += "<название задачи> | <название предшествующей задачи1>, <название предшествующей задачи2>, ...\n\n"
+    message += "Список существующих задач:\n"
+
+    # Показываем список задач
+    for i, task in enumerate(project_data['tasks'], 1):
+        message += f"{i}. {task['name']}\n"
+
+    # Отправляем сообщение с клавиатурой
+    try:
+        await query.edit_message_text(
+            message,
+            reply_markup=dependencies_actions_keyboard()
+        )
+        logger.info("Dependencies screen displayed successfully")
+        return BotStates.ADD_DEPENDENCIES
+    except Exception as e:
+        logger.error(f"Error showing dependencies: {str(e)}")
+        # В случае ошибки отправляем новое сообщение
+        await query.message.reply_text(
+            message,
+            reply_markup=dependencies_actions_keyboard()
+        )
+        return BotStates.ADD_DEPENDENCIES

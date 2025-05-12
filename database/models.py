@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, DateTime, Table
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, DateTime, Table, Date as SQLAlchemyDate
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, backref
 from datetime import datetime
@@ -21,6 +21,7 @@ class Project(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.now)
+    start_date = Column(SQLAlchemyDate, nullable=True)
 
     tasks = relationship("Task", back_populates="project")
     employees = relationship("Employee", secondary=employee_project, back_populates="projects")
@@ -123,7 +124,8 @@ class TaskTemplate(Base):
     position = Column(String, nullable=False)
     order = Column(Integer, nullable=False)  # Порядок задачи в шаблоне
     required_employees = Column(Integer, default=1)  # Number of required employees
-    roles_info = Column(String, nullable=True)  # Added this line
+    roles_info = Column(String, nullable=True)  # Формат: "Должность1:длительность1|Должность2:длительность2"
+    sequential_subtasks = Column(Boolean, default=False)  # Выполнять подзадачи последовательно
 
     project_template = relationship("ProjectTemplate", back_populates="tasks")
     dependencies = relationship(
