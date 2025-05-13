@@ -417,7 +417,6 @@ def get_template_tasks(template_id):
 
         return result
 
-
 def create_project_from_template(template_id, project_name):
     """
     Creates a project based on a template.
@@ -507,6 +506,7 @@ def create_project_from_template(template_id, project_name):
 
                     # Если подзадачи должны выполняться последовательно, добавляем зависимости между ними
                     if sequential_subtasks and len(subtask_ids) > 1:
+                        logger.info(f"Creating sequential dependencies for subtasks of {template_task.name}")
                         for i in range(1, len(subtask_ids)):
                             # Каждая следующая подзадача зависит от предыдущей
                             task_dependency = TaskDependency(
@@ -514,11 +514,9 @@ def create_project_from_template(template_id, project_name):
                                 predecessor_id=subtask_ids[i - 1]
                             )
                             session.add(task_dependency)
-                            logger.info(
-                                f"Создана зависимость: подзадача {subtask_ids[i]} зависит от {subtask_ids[i - 1]}")
-
-                # Если нет roles_info, но required_employees > 1, создаем подзадачи для нескольких исполнителей
+                            logger.info(f"Created dependency: subtask {subtask_ids[i]} depends on {subtask_ids[i - 1]}")
                 elif req_employees > 1:
+                    # Если нет roles_info, но required_employees > 1, создаем подзадачи для нескольких исполнителей
                     # Создаем подзадачи для каждого исполнителя
                     subtask_ids = []  # Сохраняем IDs подзадач для создания зависимостей
 
@@ -539,6 +537,7 @@ def create_project_from_template(template_id, project_name):
 
                     # Если подзадачи должны выполняться последовательно, добавляем зависимости между ними
                     if sequential_subtasks and len(subtask_ids) > 1:
+                        logger.info(f"Creating sequential dependencies for subtasks of {template_task.name}")
                         for i in range(1, len(subtask_ids)):
                             # Каждая следующая подзадача зависит от предыдущей
                             task_dependency = TaskDependency(
@@ -546,8 +545,7 @@ def create_project_from_template(template_id, project_name):
                                 predecessor_id=subtask_ids[i - 1]
                             )
                             session.add(task_dependency)
-                            logger.info(
-                                f"Создана зависимость: подзадача {subtask_ids[i]} зависит от {subtask_ids[i - 1]}")
+                            logger.info(f"Created dependency: subtask {subtask_ids[i]} depends on {subtask_ids[i - 1]}")
             else:
                 # Regular task without subtasks
                 task = Task(
