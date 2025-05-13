@@ -41,6 +41,7 @@ class Task(Base):
     position = Column(String, nullable=True)  # Может быть null для родительских задач
     required_employees = Column(Integer, default=1)
     parent_id = Column(Integer, ForeignKey('tasks.id'), nullable=True)  # ID родительской задачи
+    sequential_subtasks = Column(Boolean, default=False)  # Добавлено: флаг последовательных подзадач
 
     project = relationship("Project", back_populates="tasks")
     predecessors = relationship(

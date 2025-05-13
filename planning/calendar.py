@@ -1,12 +1,8 @@
-# planning/calendar.py
-"""
-Модуль для создания календарного плана с учетом выходных дней сотрудников
-"""
-
 from datetime import datetime, timedelta
 import logging
 
-from database.models import Task
+from database.models import Task, TaskDependency
+from database.operations import session_scope
 
 logger = logging.getLogger(__name__)
 
@@ -55,14 +51,322 @@ def is_parent_task(task, all_tasks):
     return False
 
 
-"""
-Полная версия функции create_calendar_plan с интегрированными изменениями
-"""
+def assign_subtasks_within_parent_constraints(task, parent_start_date, parent_end_date, position_employee_map,
+                                              employee_schedule, days_off_map, start_date, is_sequential=False,
+                                              sequential_subtasks_dict=None, previous_subtask_end=None):
+    """
+    Назначает подзадачи так, чтобы они укладывались в сроки родительской задачи.
+    Если is_sequential=True, подзадачи будут назначены последовательно, одна за другой.
+
+    Args:
+        task: Подзадача для назначения
+        parent_start_date: Дата начала родительской задачи
+        parent_end_date: Дата окончания родительской задачи
+        position_employee_map: Словарь {должность: список сотрудников}
+        employee_schedule: Расписание сотрудников
+        days_off_map: Словарь выходных дней
+        start_date: Дата начала проекта
+        is_sequential: Флаг, указывающий, что подзадачи выполняются последовательно
+        sequential_subtasks_dict: Словарь {parent_id: [упорядоченный список подзадач]}
+        previous_subtask_end: Дата окончания предыдущей подзадачи для последовательного выполнения
+
+    Returns:
+        Tuple: (success, task_start_date, task_end_date, assigned_employee_id)
+    """
+    position = task.get('position', '')
+    task_id = task.get('id')
+    parent_id = task.get('parent_id')
+
+    # Получаем сотрудников для данной должности
+    available_employees = position_employee_map.get(position, [])
+    if not available_employees:
+        logger.warning(f"No employees found for position {position} for subtask {task['name']}")
+        return False, None, None, None
+
+    logger.info(f"Looking for employees with position {position} for task {task['name']}")
+
+    # Проверяем, есть ли ограничения по предыдущим подзадачам при последовательном выполнении
+    earliest_possible_start = parent_start_date
+
+    # Если это последовательные подзадачи и есть предыдущая подзадача
+    if is_sequential and previous_subtask_end:
+        # Начало текущей подзадачи должно быть после окончания предыдущей
+        earliest_possible_start = max(earliest_possible_start, previous_subtask_end + timedelta(days=1))
+        logger.info(f"Sequential subtask, must start after {previous_subtask_end} (previous subtask)")
+
+    # Перебираем всех сотрудников в поисках того, кто может выполнить задачу в рамках родительской
+    for employee in available_employees:
+        # Проверяем, когда сотрудник может начать задачу (не раньше earliest_possible_start)
+        emp_earliest_start = find_earliest_available_date(
+            employee['id'],
+            earliest_possible_start,
+            employee_schedule,
+            days_off_map
+        )
+
+        # Проверяем, сможет ли сотрудник закончить до parent_end_date
+        task_end_date = calculate_task_end_date_with_constraints(
+            emp_earliest_start,
+            task['duration'],
+            days_off_map.get(employee['id'], []),
+            parent_end_date
+        )
+
+        # Если task_end_date <= parent_end_date, значит сотрудник может выполнить задачу вовремя
+        if task_end_date and task_end_date <= parent_end_date:
+            logger.info(f"Found employee {employee['name']} for task {task['name']} to fit parent constraints")
+            return True, emp_earliest_start, task_end_date, employee['id']
+
+    # Если не нашли подходящего сотрудника, ищем самого раннего доступного
+    logger.warning(f"Could not find employee to fit task {task['name']} within parent constraints")
+
+    # Берем первого доступного сотрудника и назначаем как можно раньше
+    if available_employees:
+        employee = available_employees[0]
+        earliest_start = find_earliest_available_date(
+            employee['id'], earliest_possible_start, employee_schedule, days_off_map
+        )
+        task_end_date = calculate_task_end_date(
+            earliest_start, task['duration'], days_off_map.get(employee['id'], [])
+        )
+
+        logger.info(
+            f"Using employee {employee['name']} for task {task['name']} even though it exceeds parent constraints")
+        return False, earliest_start, task_end_date, employee['id']
+
+    return False, None, None, None
+
+
+def check_task_dependencies_complete(task_id, task_dependencies, task_completion_dates, current_date):
+    """
+    Checks if all dependencies for a task are complete by the current date.
+
+    Args:
+        task_id: ID of the task to check
+        task_dependencies: Dictionary mapping task IDs to lists of predecessor IDs
+        task_completion_dates: Dictionary mapping task IDs to their completion dates
+        current_date: The current planning date
+
+    Returns:
+        Boolean: True if all dependencies are satisfied, False otherwise
+    """
+    # If task has no dependencies, it can start
+    if task_id not in task_dependencies:
+        return True
+
+    # Check each predecessor
+    for pred_id in task_dependencies.get(task_id, []):
+        # If predecessor isn't complete yet, task can't start
+        if pred_id not in task_completion_dates:
+            return False
+
+        # If predecessor completes after current_date, task can't start
+        pred_end_date = task_completion_dates[pred_id]
+        if pred_end_date >= current_date:
+            return False
+
+    # All dependencies are satisfied
+    return True
+
+
+def enforce_critical_path_order(calendar_plan, critical_path_names, start_date):
+    """
+    Enforces the correct order of tasks in the critical path.
+
+    Args:
+        calendar_plan: The calendar plan with tasks
+        critical_path_names: List of task names in the critical path, in order
+        start_date: Project start date
+
+    Returns:
+        Updated calendar plan
+    """
+    # Create a mapping of task names to task objects
+    tasks_by_name = {}
+    for task in calendar_plan['tasks']:
+        if task['name'] not in tasks_by_name:
+            tasks_by_name[task['name']] = task
+
+    # Process critical path tasks in order
+    current_date = start_date
+    for name in critical_path_names:
+        if name in tasks_by_name:
+            task = tasks_by_name[name]
+
+            # If task is a parent task with sequential subtasks,
+            # just ensure it starts no earlier than current_date
+            if task.get('is_parent', False):
+                if task['start_date'] < current_date:
+                    # Calculate shift needed
+                    shift = (current_date - task['start_date']).days
+
+                    # Move parent task
+                    task['start_date'] = current_date
+                    task['end_date'] = task['end_date'] + timedelta(days=shift)
+
+                    # Move all its subtasks by the same shift
+                    for subtask in calendar_plan['tasks']:
+                        if subtask.get('parent_task_id') == task['id']:
+                            subtask['start_date'] += timedelta(days=shift)
+                            subtask['end_date'] += timedelta(days=shift)
+
+                # Update current_date to after this parent task
+                current_date = task['end_date'] + timedelta(days=1)
+            else:
+                # Regular task - ensure it starts on or after current_date
+                if task['start_date'] < current_date:
+                    duration = (task['end_date'] - task['start_date']).days
+                    task['start_date'] = current_date
+                    task['end_date'] = current_date + timedelta(days=duration)
+
+                # Update current_date to after this task
+                current_date = task['end_date'] + timedelta(days=1)
+
+    return calendar_plan
+
+
+def fix_parent_task_dates(calendar_plan):
+    """
+    Fixes parent task dates to properly encapsulate their subtasks.
+
+    Args:
+        calendar_plan: The calendar plan with tasks
+
+    Returns:
+        Updated calendar plan
+    """
+    # Group tasks by parent_id
+    tasks_by_parent = {}
+    for task in calendar_plan['tasks']:
+        parent_id = task.get('parent_task_id') or task.get('parent_id')
+        if parent_id:
+            if parent_id not in tasks_by_parent:
+                tasks_by_parent[parent_id] = []
+            tasks_by_parent[parent_id].append(task)
+
+    # Process each parent task
+    for task in calendar_plan['tasks']:
+        if task.get('is_parent', False) and task['id'] in tasks_by_parent:
+            subtasks = tasks_by_parent[task['id']]
+            if subtasks:
+                # Find earliest start and latest end date among subtasks
+                earliest_start = min(subtask['start_date'] for subtask in subtasks)
+                latest_end = max(subtask['end_date'] for subtask in subtasks)
+
+                # Update parent task dates
+                task['start_date'] = earliest_start
+                task['end_date'] = latest_end
+                task['duration'] = (latest_end - earliest_start).days + 1
+
+    return calendar_plan
+
+
+def process_sequential_subtasks(calendar_plan, start_date):
+    """
+    Ensures sequential subtasks are properly scheduled one after another.
+
+    Args:
+        calendar_plan: The calendar plan with tasks
+        start_date: Project start date
+
+    Returns:
+        Updated calendar plan
+    """
+    # Find parent tasks with sequential_subtasks flag
+    with session_scope() as session:
+        sequential_parent_ids = []
+        # Fetch all sequential parent tasks
+        sequential_parents = session.query(Task).filter(
+            Task.project_id == calendar_plan.get('project_id'),
+            Task.sequential_subtasks == True
+        ).all()
+
+        for parent in sequential_parents:
+            sequential_parent_ids.append(parent.id)
+
+    # Group tasks by parent
+    tasks_by_parent = {}
+    for task in calendar_plan['tasks']:
+        parent_id = task.get('parent_task_id') or task.get('parent_id')
+        if parent_id:
+            if parent_id not in tasks_by_parent:
+                tasks_by_parent[parent_id] = []
+            tasks_by_parent[parent_id].append(task)
+
+    # Process each sequential parent
+    for parent_id in sequential_parent_ids:
+        if parent_id in tasks_by_parent:
+            subtasks = tasks_by_parent[parent_id]
+
+            # Sort subtasks by name for consistent ordering
+            subtasks.sort(key=lambda t: t['name'])
+
+            # Ensure first subtask starts no earlier than parent task's start date
+            parent_task = None
+            for task in calendar_plan['tasks']:
+                if task['id'] == parent_id:
+                    parent_task = task
+                    break
+
+            if parent_task and subtasks:
+                current_date = parent_task['start_date']
+
+                # Process subtasks in order
+                for i, subtask in enumerate(subtasks):
+                    # Get employee ID and days off
+                    employee_id = None
+                    employee_days_off = []
+
+                    # Find the employee assigned to this subtask
+                    employee_name = subtask.get('employee')
+                    if employee_name:
+                        for employee in calendar_plan.get('employees', []):
+                            if employee['name'] == employee_name:
+                                employee_id = employee['id']
+                                employee_days_off = [get_weekday_number(day) for day in employee.get('days_off', [])]
+                                break
+
+                    # Calculate the appropriate start date (after previous task and accounting for days off)
+                    subtask_start = current_date
+                    if employee_id and employee_days_off:
+                        # Skip days off
+                        while subtask_start.weekday() in employee_days_off:
+                            subtask_start += timedelta(days=1)
+
+                    # Calculate end date based on duration
+                    duration = subtask['duration']
+                    working_days = 0
+                    subtask_end = subtask_start
+
+                    while working_days < duration:
+                        if subtask_end.weekday() not in employee_days_off:
+                            working_days += 1
+
+                        if working_days < duration:
+                            subtask_end += timedelta(days=1)
+
+                    # Update subtask dates
+                    subtask['start_date'] = subtask_start
+                    subtask['end_date'] = subtask_end
+
+                    # Update current_date for next subtask
+                    current_date = subtask_end + timedelta(days=1)
+
+                # Update parent task dates to match subtasks
+                if subtasks:
+                    earliest_start = min(s['start_date'] for s in subtasks)
+                    latest_end = max(s['end_date'] for s in subtasks)
+
+                    parent_task['start_date'] = earliest_start
+                    parent_task['end_date'] = latest_end
+                    parent_task['duration'] = (latest_end - earliest_start).days + 1
+
+    return calendar_plan
 
 
 def create_calendar_plan(network_parameters, project_data, start_date=None):
     """
-    Создает календарный план с учетом выходных дней сотрудников и зависимостей между подзадачами.
+    Создает календарный план с учетом выходных дней сотрудников.
     """
     if start_date is None:
         start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -70,18 +374,68 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
     network = network_parameters['network']
     employees = project_data['employees']
     critical_path = network_parameters['critical_path']
+    project_id = project_data['id']
 
-    # Логируем основную информацию
+    # Add project_id to calendar_plan for reference by helper functions
+    calendar_plan = {
+        'tasks': [],
+        'critical_path': [task['name'] for task in critical_path],
+        'project_duration': calculate_project_duration_with_days_off(network, employees, start_date),
+        'employees': employees,
+        'project_id': project_id
+    }
+
+    # Logging for debugging
     logger.info("=== Начало создания календарного плана ===")
     logger.info(f"Количество задач в сети: {len(network)}")
     logger.info(f"Количество сотрудников: {len(employees)}")
     logger.info(f"Дата начала проекта: {start_date.strftime('%d.%m.%Y')}")
+    logger.info(f"Критический путь: {calendar_plan['critical_path']}")
 
-    # Identify parent tasks and mark them
-    for task in network:
-        task['is_parent'] = is_parent_task(task, network)
-        if task['is_parent']:
-            logger.info(f"Identified parent task: {task['name']}")
+    # Get direct dependencies between tasks from the database
+    task_dependencies = {}
+
+    with session_scope() as session:
+        # Get all tasks for the project
+        db_tasks = session.query(Task).filter(Task.project_id == project_id).all()
+
+        # Create task_id to task mapping for quick access
+        db_tasks_by_id = {task.id: task for task in db_tasks}
+
+        # Get all dependencies
+        all_dependencies = session.query(TaskDependency).join(
+            Task, TaskDependency.task_id == Task.id
+        ).filter(Task.project_id == project_id).all()
+
+        # Build dependency dictionary
+        for dep in all_dependencies:
+            if dep.task_id not in task_dependencies:
+                task_dependencies[dep.task_id] = []
+            task_dependencies[dep.task_id].append(dep.predecessor_id)
+
+            # Log dependency information
+            task_name = db_tasks_by_id.get(dep.task_id, Task(name="Unknown")).name
+            pred_name = db_tasks_by_id.get(dep.predecessor_id, Task(name="Unknown")).name
+            logger.info(f"Found dependency: {task_name} depends on {pred_name}")
+
+        # Identify parent tasks with sequential_subtasks flag
+        sequential_parent_tasks = {}
+        for task in db_tasks:
+            if hasattr(task, 'sequential_subtasks') and task.sequential_subtasks:
+                if task.subtasks:
+                    logger.info(f"Found parent task with sequential subtasks: {task.name} (ID: {task.id})")
+                    sequential_parent_tasks[task.id] = task
+
+    # Convert task dependencies to task name dependencies for easier critical path enforcement
+    name_dependencies = {}
+    for task_id, predecessors in task_dependencies.items():
+        task_name = next((t.name for t in db_tasks if t.id == task_id), None)
+        if task_name:
+            name_dependencies[task_name] = []
+            for pred_id in predecessors:
+                pred_name = next((t.name for t in db_tasks if t.id == pred_id), None)
+                if pred_name:
+                    name_dependencies[task_name].append(pred_name)
 
     # Преобразуем названия дней недели в числовые значения
     days_off_map = {
@@ -97,123 +451,21 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
             position_employee_map[position] = []
         position_employee_map[position].append(employee)
 
-    # Логи маппинга должностей
-    logger.info("\n=== Маппинг должностей ===")
-    for position, emps in position_employee_map.items():
-        logger.info(f"Должность '{position}': {len(emps)} сотрудников")
-        for emp in emps:
-            logger.info(f"  - {emp['name']}")
+    # Оптимизация распределения сотрудников
+    optimized_network = optimize_employee_assignment(network, position_employee_map, {}, days_off_map, start_date)
 
-    # Создаем календарный план
-    calendar_plan = {
-        'tasks': [],
-        'critical_path': [task['name'] for task in critical_path],
-        'project_duration': calculate_project_duration_with_days_off(network, employees, start_date)
-    }
-
-    # Словарь для отслеживания загруженности сотрудников
-    employee_schedule = {employee['id']: [] for employee in employees}
-
-    # Создаем счетчик нагрузки для каждого сотрудника
-    employee_workload = {employee['id']: 0 for employee in employees}
-
-    # --- ФУНКЦИЯ ДЛЯ ОПРЕДЕЛЕНИЯ, ЯВЛЯЕТСЯ ЛИ РОДИТЕЛЬСКАЯ ЗАДАЧА ПОСЛЕДОВАТЕЛЬНОЙ ---
-    def is_sequential_parent_task(task_id):
-        """Проверяет, является ли родительская задача последовательной."""
-        return task_id in sequential_parent_tasks
-
-    # --- ЗАГРУЗКА ЗАВИСИМОСТЕЙ ЗАДАЧ ИЗ БАЗЫ ДАННЫХ ---
-    def load_task_dependencies(project_data):
-        """Загружает зависимости между задачами из базы данных."""
-        from database.operations import session_scope
-        from database.models import TaskDependency
-
-        task_dependencies = {}
-
-        with session_scope() as session:
-            # Получаем все задачи проекта
-            project_id = project_data.get('id')
-            if not project_id:
-                logger.error("Project ID not found in project_data")
-                return task_dependencies
-
-            # Получаем все зависимости для задач проекта
-            dependencies = session.query(TaskDependency).join(Task, Task.id == TaskDependency.task_id).filter(
-                Task.project_id == project_id).all()
-
-            for dependency in dependencies:
-                if dependency.task_id not in task_dependencies:
-                    task_dependencies[dependency.task_id] = []
-                task_dependencies[dependency.task_id].append(dependency.predecessor_id)
-                logger.info(f"Loaded dependency: Task {dependency.task_id} depends on {dependency.predecessor_id}")
-
-        return task_dependencies
-
-    # --- ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ПОСЛЕДОВАТЕЛЬНЫХ РОДИТЕЛЬСКИХ ЗАДАЧАХ ---
-    def get_sequential_parent_tasks(project_data):
-        """Определяет, какие родительские задачи имеют последовательное выполнение подзадач."""
-        sequential_tasks = set()
-
-        # Получаем все задачи из проекта
-        tasks = project_data.get('tasks', [])
-
-        # Находим родительские задачи
-        parent_tasks = {}
-        child_tasks = {}
-
-        for task in tasks:
-            if task.get('parent_id'):
-                if task['parent_id'] not in child_tasks:
-                    child_tasks[task['parent_id']] = []
-                child_tasks[task['parent_id']].append(task)
-            else:
-                parent_tasks[task['id']] = task
-
-        # Проверяем для каждой родительской задачи с подзадачами,
-        # есть ли зависимости между подзадачами
-        for parent_id, children in child_tasks.items():
-            if len(children) < 2:
-                continue
-
-            # Проверяем наличие зависимостей между подзадачами
-            has_sequential_deps = False
-            child_ids = [child['id'] for child in children]
-
-            for child_id in child_ids:
-                if child_id in tasks_dependencies:
-                    # Есть ли среди зависимостей другие подзадачи этого же родителя?
-                    for pred_id in tasks_dependencies[child_id]:
-                        if pred_id in child_ids:
-                            has_sequential_deps = True
-                            break
-
-                if has_sequential_deps:
-                    break
-
-            if has_sequential_deps:
-                sequential_tasks.add(parent_id)
-                logger.info(f"Parent task {parent_id} is marked as sequential")
-
-        return sequential_tasks
-
-    # Загружаем зависимости между задачами из базы данных
-    tasks_dependencies = load_task_dependencies(project_data)
-
-    # Получаем информацию о том, какие родительские задачи имеют последовательное выполнение подзадач
-    sequential_parent_tasks = get_sequential_parent_tasks(project_data)
-
-    # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: используем функцию оптимизации
-    optimized_network = optimize_employee_assignment(network, position_employee_map, employee_schedule, days_off_map,
-                                                     start_date)
-
-    # Создаем словарь для быстрого доступа к задачам
+    # Словарь для быстрого доступа к задачам
     network_by_id = {task['id']: task for task in optimized_network}
 
-    # Обрабатываем родительские задачи и их подзадачи
+    # Dictionary to track task completion dates
+    task_completion_dates = {}
+
+    # Process all tasks to create an initial calendar plan
+    # Step 1: Process parent tasks and their subtasks
     parent_tasks = {}
     parent_subtasks = {}
 
-    # Находим все родительские задачи и их подзадачи
+    # First pass: Create parent tasks
     for task in optimized_network:
         if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
             task_start_date = start_date + timedelta(days=task.get('early_start', 0))
@@ -236,267 +488,248 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
             parent_tasks[task['id']] = parent_task
             parent_subtasks[task['id']] = []
 
-            # Добавляем в календарный план
+            # Add to calendar plan
             calendar_plan['tasks'].append(parent_task)
 
-    # Находим подзадачи для каждой родительской задачи
+    # Second pass: Find subtasks for each parent task
     for task in optimized_network:
-        # Пропускаем родительские задачи
+        # Skip parent tasks
         if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
             continue
 
-        # Проверяем, есть ли у задачи родитель
+        # Check if task is a subtask by parent_id or by name pattern
         parent_id = task.get('parent_id')
+
+        # If parent_id is explicitly set
         if parent_id and parent_id in parent_tasks:
             parent_subtasks[parent_id].append(task)
             continue
 
-        # Проверяем по имени задачи
+        # If no parent_id, check by name pattern
         task_name = task.get('name', '')
         if ' - ' in task_name:
-            base_name = task_name.split(' - ')[0]
-            # Ищем родительскую задачу по имени
+            parent_name = task_name.split(' - ')[0]
+
+            # Find parent task by name
+            parent_id = None
             for pid, parent in parent_tasks.items():
-                if parent['name'] == base_name:
-                    parent_subtasks[pid].append(task)
+                if parent['name'] == parent_name:
+                    parent_id = pid
                     break
 
-    # Обрабатываем подзадачи
+            # If parent found, add to its subtasks
+            if parent_id:
+                parent_subtasks[parent_id].append(task)
+                continue
+
+    # Third pass: Process subtasks and assign employees
+    employee_schedule = {employee['id']: [] for employee in employees}
+    employee_workload = {employee['id']: 0 for employee in employees}
+
     for parent_id, subtasks in parent_subtasks.items():
         parent = parent_tasks[parent_id]
 
-        # Проверяем, является ли родительская задача последовательной
-        is_sequential = is_sequential_parent_task(parent_id)
+        # Check if this parent has sequential subtasks
+        is_sequential = parent_id in sequential_parent_tasks
 
         if is_sequential:
-            logger.info(f"Processing sequential parent task: {parent['name']}")
-            # Для последовательных задач - определяем порядок выполнения
+            logger.info(f"Processing sequential subtasks for parent task: {parent['name']}")
 
-            # Создаем словарь ID -> задача
-            subtasks_by_id = {subtask['id']: subtask for subtask in subtasks}
+            # Sort subtasks by name for consistent ordering
+            subtasks.sort(key=lambda t: t['name'])
 
-            # Строим порядок выполнения на основе зависимостей
-            execution_order = []
-            visited = set()
+            # Process subtasks in sequence
+            current_date = parent['start_date']
 
-            def build_execution_order(task_id):
-                if task_id in visited or task_id not in subtasks_by_id:
-                    return
-                visited.add(task_id)
-
-                # Обрабатываем предшественников
-                if task_id in tasks_dependencies:
-                    for pred_id in tasks_dependencies[task_id]:
-                        if pred_id in subtasks_by_id:
-                            build_execution_order(pred_id)
-
-                execution_order.append(subtasks_by_id[task_id])
-
-            # Строим порядок для всех подзадач
             for subtask in subtasks:
-                build_execution_order(subtask['id'])
-
-            # Если в порядок вошли не все подзадачи, добавляем оставшиеся
-            if len(execution_order) < len(subtasks):
-                for subtask in subtasks:
-                    if subtask['id'] not in visited:
-                        execution_order.append(subtask)
-
-            # Теперь у нас есть порядок выполнения подзадач
-            # Назначаем даты последовательно
-            previous_end_date = None
-            for subtask in execution_order:
                 position = subtask.get('position', '')
 
-                # Получаем сотрудников для данной должности
+                # Find available employees for this position
                 available_employees = position_employee_map.get(position, [])
 
-                if not available_employees:
-                    logger.warning(f"No employees found for position {position} for subtask {subtask['name']}")
-                    continue
+                if available_employees:
+                    # Sort by workload
+                    available_employees = sorted(available_employees, key=lambda e: employee_workload.get(e['id'], 0))
 
-                # Определяем минимальную дату начала
-                min_start_date = parent['start_date']
-                if previous_end_date:
-                    min_start_date = max(min_start_date, previous_end_date + timedelta(days=1))
+                    # Select employee
+                    employee = available_employees[0]
+                    employee_id = employee['id']
 
-                # Находим лучшего сотрудника
-                best_employee = None
-                best_start_date = None
-                best_end_date = None
+                    # Calculate start and end dates considering days off
+                    subtask_start = current_date
+                    while subtask_start.weekday() in days_off_map.get(employee_id, []):
+                        subtask_start += timedelta(days=1)
 
-                for employee in available_employees:
-                    # Находим самую раннюю дату начала для этого сотрудника
-                    earliest_start = find_earliest_available_date(
-                        employee['id'], min_start_date, employee_schedule, days_off_map
+                    subtask_end = calculate_task_end_date(
+                        subtask_start,
+                        subtask['duration'],
+                        days_off_map.get(employee_id, [])
                     )
 
-                    # Вычисляем дату окончания
-                    task_end_date = calculate_task_end_date(
-                        earliest_start, subtask['duration'], days_off_map.get(employee['id'], [])
-                    )
-
-                    # Выбираем сотрудника с самой ранней датой окончания
-                    if not best_end_date or task_end_date < best_end_date:
-                        best_employee = employee
-                        best_start_date = earliest_start
-                        best_end_date = task_end_date
-
-                if best_employee:
-                    # Добавляем задачу в расписание сотрудника
-                    employee_schedule[best_employee['id']].append({
+                    # Add to employee schedule
+                    employee_schedule[employee_id].append({
                         'task_id': subtask['id'],
-                        'start_date': best_start_date,
-                        'end_date': best_end_date
+                        'start_date': subtask_start,
+                        'end_date': subtask_end
                     })
 
-                    # Обновляем нагрузку сотрудника
-                    employee_workload[best_employee['id']] += subtask['duration']
+                    # Update workload
+                    employee_workload[employee_id] += subtask['duration']
 
-                    # Добавляем подзадачу в календарный план
-                    calendar_plan['tasks'].append({
+                    # Add to calendar plan
+                    subtask_entry = {
                         'id': subtask['id'],
                         'name': subtask['name'],
-                        'start_date': best_start_date,
-                        'end_date': best_end_date,
+                        'start_date': subtask_start,
+                        'end_date': subtask_end,
                         'duration': subtask['duration'],
                         'is_critical': subtask.get('is_critical', False),
                         'reserve': subtask.get('reserve', 0),
-                        'employee': best_employee['name'],
-                        'employee_email': best_employee.get('email', ''),
+                        'employee': employee['name'],
+                        'employee_email': employee.get('email', ''),
                         'position': position,
                         'is_subtask': True,
-                        'parent_task_id': parent_id
-                    })
+                        'parent_task_id': parent_id,
+                        'parent_id': parent_id
+                    }
 
-                    # Запоминаем дату окончания для следующей подзадачи
-                    previous_end_date = best_end_date
+                    calendar_plan['tasks'].append(subtask_entry)
+
+                    # Store completion date
+                    task_completion_dates[subtask['id']] = subtask_end
+
+                    # Update current_date for next subtask
+                    current_date = subtask_end + timedelta(days=1)
 
                     logger.info(
-                        f"Assigned sequential subtask '{subtask['name']}' to {best_employee['name']} ({best_start_date.strftime('%d.%m.%Y')} - {best_end_date.strftime('%d.%m.%Y')})")
-
-                    # Корректируем даты родительской задачи, если нужно
-                    if best_start_date < parent['start_date']:
-                        parent['start_date'] = best_start_date
-                    if best_end_date > parent['end_date']:
-                        parent['end_date'] = best_end_date
-
-                    # Обновляем длительность родительской задачи
-                    parent['duration'] = (parent['end_date'] - parent['start_date']).days + 1
+                        f"Scheduled sequential subtask {subtask['name']} for {employee['name']} from {subtask_start.strftime('%d.%m.%Y')} to {subtask_end.strftime('%d.%m.%Y')}")
+                else:
+                    logger.warning(f"No employees found for position {position} for subtask {subtask['name']}")
         else:
-            # Для неекпоследовательных задач - назначаем их параллельно
+            # Non-sequential subtasks - process in parallel
             for subtask in subtasks:
                 position = subtask.get('position', '')
 
-                # Получаем сотрудников для данной должности
+                # Find available employees
                 available_employees = position_employee_map.get(position, [])
 
-                if not available_employees:
+                if available_employees:
+                    # Sort by workload
+                    available_employees = sorted(available_employees, key=lambda e: employee_workload.get(e['id'], 0))
+
+                    # Select employee
+                    employee = available_employees[0]
+                    employee_id = employee['id']
+
+                    # Find earliest start date when employee is available
+                    earliest_start = find_earliest_available_date(
+                        employee_id,
+                        parent['start_date'],
+                        employee_schedule,
+                        days_off_map.get(employee_id, [])
+                    )
+
+                    # Calculate end date
+                    subtask_end = calculate_task_end_date(
+                        earliest_start,
+                        subtask['duration'],
+                        days_off_map.get(employee_id, [])
+                    )
+
+                    # Add to employee schedule
+                    employee_schedule[employee_id].append({
+                        'task_id': subtask['id'],
+                        'start_date': earliest_start,
+                        'end_date': subtask_end
+                    })
+
+                    # Update workload
+                    employee_workload[employee_id] += subtask['duration']
+
+                    # Add to calendar plan
+                    subtask_entry = {
+                        'id': subtask['id'],
+                        'name': subtask['name'],
+                        'start_date': earliest_start,
+                        'end_date': subtask_end,
+                        'duration': subtask['duration'],
+                        'is_critical': subtask.get('is_critical', False),
+                        'reserve': subtask.get('reserve', 0),
+                        'employee': employee['name'],
+                        'employee_email': employee.get('email', ''),
+                        'position': position,
+                        'is_subtask': True,
+                        'parent_task_id': parent_id,
+                        'parent_id': parent_id
+                    }
+
+                    calendar_plan['tasks'].append(subtask_entry)
+
+                    # Store completion date
+                    task_completion_dates[subtask['id']] = subtask_end
+
+                    logger.info(
+                        f"Scheduled parallel subtask {subtask['name']} for {employee['name']} from {earliest_start.strftime('%d.%m.%Y')} to {subtask_end.strftime('%d.%m.%Y')}")
+                else:
                     logger.warning(f"No employees found for position {position} for subtask {subtask['name']}")
-                    continue
 
-                # Сортируем сотрудников по загруженности
-                available_employees = sorted(available_employees, key=lambda e: employee_workload[e['id']])
+    # Track which tasks we've already processed
+    processed_tasks = set()
+    for parent_id, subtasks in parent_subtasks.items():
+        for subtask in subtasks:
+            processed_tasks.add(subtask['id'])
 
-                # Берем наименее загруженного сотрудника
-                employee = available_employees[0]
+    # Add parent task IDs to processed
+    for parent_id in parent_tasks:
+        processed_tasks.add(parent_id)
 
-                # Находим самую раннюю дату начала для этого сотрудника
-                task_start_date = find_earliest_available_date(
-                    employee['id'], parent['start_date'], employee_schedule, days_off_map
-                )
+    # Step 2: Process regular tasks - first critical path
+    critical_task_ids = set(task['id'] for task in critical_path)
+    critical_tasks = [t for t in optimized_network if t['id'] in critical_task_ids and t['id'] not in processed_tasks]
 
-                # Вычисляем дату окончания
-                task_end_date = calculate_task_end_date(
-                    task_start_date, subtask['duration'], days_off_map.get(employee['id'], [])
-                )
+    # Sort critical tasks by early start
+    critical_tasks.sort(key=lambda t: t['early_start'])
 
-                # Добавляем задачу в расписание сотрудника
-                employee_schedule[employee['id']].append({
-                    'task_id': subtask['id'],
-                    'start_date': task_start_date,
-                    'end_date': task_end_date
-                })
-
-                # Обновляем нагрузку сотрудника
-                employee_workload[employee['id']] += subtask['duration']
-
-                # Добавляем подзадачу в календарный план
-                calendar_plan['tasks'].append({
-                    'id': subtask['id'],
-                    'name': subtask['name'],
-                    'start_date': task_start_date,
-                    'end_date': task_end_date,
-                    'duration': subtask['duration'],
-                    'is_critical': subtask.get('is_critical', False),
-                    'reserve': subtask.get('reserve', 0),
-                    'employee': employee['name'],
-                    'employee_email': employee.get('email', ''),
-                    'position': position,
-                    'is_subtask': True,
-                    'parent_task_id': parent_id
-                })
-
-                logger.info(
-                    f"Assigned parallel subtask '{subtask['name']}' to {employee['name']} ({task_start_date.strftime('%d.%m.%Y')} - {task_end_date.strftime('%d.%m.%Y')})")
-
-                # Корректируем даты родительской задачи, если нужно
-                if task_end_date > parent['end_date']:
-                    parent['end_date'] = task_end_date
-
-                # Обновляем длительность родительской задачи
-                parent['duration'] = (parent['end_date'] - parent['start_date']).days + 1
-
-    # Пропускаем подзадачи при обработке основных задач
-    skip_tasks = set(task['id'] for tasks in parent_subtasks.values() for task in tasks)
-
-    # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: сначала обрабатываем критический путь, потом остальные задачи
-    critical_task_ids = [task['id'] for task in critical_path]
-
-    # Сортируем все задачи: сначала критические, затем остальные
-    all_tasks = sorted(optimized_network, key=lambda t: t['early_start'])
-    critical_tasks = [t for t in all_tasks if t['id'] in critical_task_ids]
-    non_critical_tasks = [t for t in all_tasks if t['id'] not in critical_task_ids]
-
-    # 1. Сначала обрабатываем критические задачи
+    # Track current date for critical path
     current_date = start_date
+
+    # Process critical tasks in order
     for task in critical_tasks:
-        # Пропускаем задачи, которые уже обработаны как подзадачи
-        if task['id'] in skip_tasks:
-            continue
-
-        # Пропускаем родительские задачи, которые уже обработаны выше
-        if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
-            continue
-
         position = task.get('position', '')
 
-        # Если у задачи есть назначенный сотрудник из оптимизации
+        # Check dependencies for this task
+        earliest_start = current_date
+        if task['id'] in task_dependencies:
+            for pred_id in task_dependencies[task['id']]:
+                if pred_id in task_completion_dates:
+                    pred_end = task_completion_dates[pred_id]
+                    earliest_start = max(earliest_start, pred_end + timedelta(days=1))
+                    logger.info(
+                        f"Task {task['name']} depends on task {pred_id} which ends on {pred_end.strftime('%d.%m.%Y')}")
+
+        # Find employee for this task
         if 'assigned_employee_id' in task:
             employee_id = task['assigned_employee_id']
             employee = next((e for e in employees if e['id'] == employee_id), None)
 
             if employee:
-                # Вычисляем даты с учетом доступности сотрудника
+                # Calculate task dates
                 task_start_date, task_end_date = calculate_task_dates(
                     task, employee_id, days_off_map.get(employee_id, []),
-                    current_date, employee_schedule
+                    earliest_start, employee_schedule
                 )
 
-                # Обновляем текущую дату для следующей критической задачи
-                current_date = task_end_date + timedelta(days=1)
-
-                # Добавляем в расписание сотрудника
+                # Update employee schedule
                 employee_schedule[employee_id].append({
                     'task_id': task['id'],
                     'start_date': task_start_date,
                     'end_date': task_end_date
                 })
 
-                # Обновляем нагрузку
+                # Update workload
                 employee_workload[employee_id] += task['duration']
 
-                # Добавляем задачу в план
+                # Add to calendar plan
                 calendar_plan['tasks'].append({
                     'id': task['id'],
                     'name': task['name'],
@@ -509,11 +742,165 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                     'employee_email': employee.get('email', ''),
                     'position': position
                 })
+
+                # Store completion date
+                task_completion_dates[task['id']] = task_end_date
+
+                # Update current date
+                current_date = task_end_date + timedelta(days=1)
+
+                logger.info(
+                    f"Scheduled critical task {task['name']} for {employee['name']} from {task_start_date.strftime('%d.%m.%Y')} to {task_end_date.strftime('%d.%m.%Y')}")
         else:
-            # Если нет назначенного сотрудника, добавляем задачу без исполнителя
-            task_start_date = current_date
+            # No employee assigned - find one
+            available_employees = position_employee_map.get(position, [])
+
+            if available_employees:
+                # Sort by workload
+                available_employees = sorted(available_employees, key=lambda e: employee_workload.get(e['id'], 0))
+
+                # Select employee
+                employee = available_employees[0]
+                employee_id = employee['id']
+
+                # Calculate task dates
+                task_start_date, task_end_date = calculate_task_dates(
+                    task, employee_id, days_off_map.get(employee_id, []),
+                    earliest_start, employee_schedule
+                )
+
+                # Update employee schedule
+                employee_schedule[employee_id].append({
+                    'task_id': task['id'],
+                    'start_date': task_start_date,
+                    'end_date': task_end_date
+                })
+
+                # Update workload
+                employee_workload[employee_id] += task['duration']
+
+                # Add to calendar plan
+                calendar_plan['tasks'].append({
+                    'id': task['id'],
+                    'name': task['name'],
+                    'start_date': task_start_date,
+                    'end_date': task_end_date,
+                    'duration': task['duration'],
+                    'is_critical': True,
+                    'reserve': 0,
+                    'employee': employee['name'],
+                    'employee_email': employee.get('email', ''),
+                    'position': position
+                })
+
+                # Store completion date
+                task_completion_dates[task['id']] = task_end_date
+
+                # Update current date
+                current_date = task_end_date + timedelta(days=1)
+
+                logger.info(
+                    f"Scheduled critical task {task['name']} for {employee['name']} from {task_start_date.strftime('%d.%m.%Y')} to {task_end_date.strftime('%d.%m.%Y')}")
+            else:
+                # No employees for this position
+                logger.warning(f"No employees found for position {position} for task {task['name']}")
+
+                # Schedule anyway without employee
+                task_start_date = earliest_start
+                task_end_date = task_start_date + timedelta(days=task['duration'] - 1)
+
+                calendar_plan['tasks'].append({
+                    'id': task['id'],
+                    'name': task['name'],
+                    'start_date': task_start_date,
+                    'end_date': task_end_date,
+                    'duration': task['duration'],
+                    'is_critical': True,
+                    'reserve': 0,
+                    'employee': 'Не назначен',
+                    'position': position
+                })
+
+                # Store completion date
+                task_completion_dates[task['id']] = task_end_date
+
+                # Update current date
+                current_date = task_end_date + timedelta(days=1)
+
+    # Step 3: Process regular non-critical tasks
+    non_critical_tasks = [t for t in optimized_network if
+                          t['id'] not in critical_task_ids and t['id'] not in processed_tasks]
+
+    # Sort by early start
+    non_critical_tasks.sort(key=lambda t: t['early_start'])
+
+    # Process each task
+    for task in non_critical_tasks:
+        position = task.get('position', '')
+
+        # Check dependencies
+        earliest_start = start_date
+        if task['id'] in task_dependencies:
+            for pred_id in task_dependencies[task['id']]:
+                if pred_id in task_completion_dates:
+                    pred_end = task_completion_dates[pred_id]
+                    earliest_start = max(earliest_start, pred_end + timedelta(days=1))
+                    logger.info(
+                        f"Task {task['name']} depends on task {pred_id} which ends on {pred_end.strftime('%d.%m.%Y')}")
+
+        # Find employee
+        available_employees = position_employee_map.get(position, [])
+
+        if available_employees:
+            # Sort by workload
+            available_employees = sorted(available_employees, key=lambda e: employee_workload.get(e['id'], 0))
+
+            # Select employee
+            employee = available_employees[0]
+            employee_id = employee['id']
+
+            # Calculate task dates
+            task_start_date, task_end_date = calculate_task_dates(
+                task, employee_id, days_off_map.get(employee_id, []),
+                earliest_start, employee_schedule
+            )
+
+            # Update employee schedule
+            employee_schedule[employee_id].append({
+                'task_id': task['id'],
+                'start_date': task_start_date,
+                'end_date': task_end_date
+            })
+
+            # Update workload
+            employee_workload[employee_id] += task['duration']
+
+            # Add to calendar plan
+            calendar_plan['tasks'].append({
+                'id': task['id'],
+                'name': task['name'],
+                'start_date': task_start_date,
+                'end_date': task_end_date,
+                'duration': task['duration'],
+                'is_critical': False,
+                'reserve': task.get('reserve', 0),
+                'employee': employee['name'],
+                'employee_email': employee.get('email', ''),
+                'position': position
+            })
+
+            # Store completion date
+            task_completion_dates[task['id']] = task_end_date
+
+            logger.info(
+                f"Scheduled non-critical task {task['name']} for {employee['name']} from {task_start_date.strftime('%d.%m.%Y')} to {task_end_date.strftime('%d.%m.%Y')}")
+        else:
+            # No employees for this position
+            logger.warning(f"No employees found for position {position} for task {task['name']}")
+
+            # Schedule anyway without employee
+            task_start_date = earliest_start
             task_end_date = task_start_date + timedelta(days=task['duration'] - 1)
-            current_date = task_end_date + timedelta(days=1)
 
             calendar_plan['tasks'].append({
                 'id': task['id'],
@@ -521,140 +908,37 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
                 'start_date': task_start_date,
                 'end_date': task_end_date,
                 'duration': task['duration'],
-                'is_critical': True,
-                'reserve': 0,
+                'is_critical': False,
+                'reserve': task.get('reserve', 0),
                 'employee': 'Не назначен',
                 'position': position
             })
 
-    # 2. Затем обрабатываем остальные задачи
-    for task in non_critical_tasks:
-        # Пропускаем задачи, которые уже обработаны как подзадачи
-        if task['id'] in skip_tasks:
-            continue
+            # Store completion date
+            task_completion_dates[task['id']] = task_end_date
 
-        # Пропускаем родительские задачи, которые уже обработаны выше
-        if task.get('is_parent', False) or task.get('required_employees', 1) > 1:
-            continue
+    # Apply post-processing fixes
 
-        position = task.get('position', '')
-        required_employees = task.get('required_employees', 1)
+    # 1. Enforce critical path ordering
+    calendar_plan = enforce_critical_path_order(calendar_plan, calendar_plan['critical_path'], start_date)
 
-        # Обрабатываем задачи с одним исполнителем
-        if required_employees == 1:
-            # Если есть назначенный сотрудник из оптимизации
-            if 'assigned_employee_id' in task:
-                employee_id = task['assigned_employee_id']
-                employee = next((e for e in employees if e['id'] == employee_id), None)
+    # 2. Fix parent task dates to match their subtasks
+    calendar_plan = fix_parent_task_dates(calendar_plan)
 
-                if employee:
-                    # Вычисляем даты с учетом доступности сотрудника и предшественников
-                    earliest_start = start_date
+    # 3. Ensure sequential subtasks are properly ordered
+    calendar_plan = process_sequential_subtasks(calendar_plan, start_date)
 
-                    # Учитываем предшественников
-                    for pred_id in task.get('predecessors', []):
-                        pred_task = network_by_id.get(pred_id)
-                        if pred_task and 'assigned_employee_id' in pred_task:
-                            for scheduled in employee_schedule.get(employee_id, []):
-                                if scheduled['task_id'] == pred_id:
-                                    if scheduled['end_date'] > earliest_start:
-                                        earliest_start = scheduled['end_date'] + timedelta(days=1)
+    # Calculate final project duration based on latest task end date
+    latest_end_date = max(task['end_date'] for task in calendar_plan['tasks'])
+    calendar_plan['project_duration'] = (latest_end_date - start_date).days + 1
 
-                    task_start_date, task_end_date = calculate_task_dates(
-                        task, employee_id, days_off_map.get(employee_id, []),
-                        earliest_start, employee_schedule
-                    )
-
-                    # Добавляем в расписание сотрудника
-                    employee_schedule[employee_id].append({
-                        'task_id': task['id'],
-                        'start_date': task_start_date,
-                        'end_date': task_end_date
-                    })
-
-                    # Обновляем нагрузку
-                    employee_workload[employee_id] += task['duration']
-
-                    # Добавляем задачу в план
-                    calendar_plan['tasks'].append({
-                        'id': task['id'],
-                        'name': task['name'],
-                        'start_date': task_start_date,
-                        'end_date': task_end_date,
-                        'duration': task['duration'],
-                        'is_critical': False,
-                        'reserve': task.get('reserve', 0),
-                        'employee': employee['name'],
-                        'employee_email': employee.get('email', ''),
-                        'position': position
-                    })
-            else:
-                # Если нет назначенного сотрудника, выбираем наименее загруженного
-                available_employees = position_employee_map.get(position, [])
-                if available_employees:
-                    available_employees = sorted(available_employees, key=lambda e: employee_workload[e['id']])
-                    employee = available_employees[0]
-
-                    # Вычисляем даты с учетом доступности
-                    task_start_date, task_end_date = calculate_task_dates(
-                        task, employee['id'], days_off_map.get(employee['id'], []),
-                        start_date, employee_schedule
-                    )
-
-                    # Добавляем в расписание
-                    employee_schedule[employee['id']].append({
-                        'task_id': task['id'],
-                        'start_date': task_start_date,
-                        'end_date': task_end_date
-                    })
-
-                    # Обновляем нагрузку
-                    employee_workload[employee['id']] += task['duration']
-
-                    # Добавляем задачу в план
-                    calendar_plan['tasks'].append({
-                        'id': task['id'],
-                        'name': task['name'],
-                        'start_date': task_start_date,
-                        'end_date': task_end_date,
-                        'duration': task['duration'],
-                        'is_critical': False,
-                        'reserve': task.get('reserve', 0),
-                        'employee': employee['name'],
-                        'employee_email': employee.get('email', ''),
-                        'position': position
-                    })
-
-    # Проверяем, все ли задачи включены в план
-    critical_task_names = set(calendar_plan['critical_path'])
-    existing_tasks = {task.get('name', '') for task in calendar_plan['tasks']}
-
-    # Добавляем недостающие задачи критического пути
-    for task in network:
-        if task['name'] in critical_task_names and task['name'] not in existing_tasks:
-            task_start = start_date + timedelta(days=task.get('early_start', 0))
-            task_end = start_date + timedelta(days=task.get('early_finish', 0))
-
-            calendar_plan['tasks'].append({
-                'id': task.get('id'),
-                'name': task.get('name'),
-                'start_date': task_start,
-                'end_date': task_end,
-                'duration': task.get('duration', 0),
-                'is_critical': True,
-                'reserve': 0,
-                'position': task.get('position', ''),
-                'employee': None if task.get('is_parent', False) else 'Не назначен',
-                'is_parent': task.get('is_parent', False)
-            })
-
-    # Итоги
+    # Log results
     logger.info("\n=== Итоги создания календарного плана ===")
     logger.info(f"Создано задач: {len(calendar_plan['tasks'])}")
     logger.info(f"Критический путь: {', '.join(calendar_plan['critical_path'])}")
     logger.info(f"Длительность проекта: {calendar_plan['project_duration']} дней")
 
-    # Выводим нагрузку сотрудников
+    # Log employee workload
     logger.info("\n=== Распределение нагрузки между сотрудниками ===")
     for emp_id, workload in sorted(employee_workload.items(), key=lambda x: x[1], reverse=True):
         employee = next((e for e in employees if e['id'] == emp_id), None)
@@ -662,6 +946,7 @@ def create_calendar_plan(network_parameters, project_data, start_date=None):
             logger.info(f"{employee['name']} ({employee['position']}): {workload} дней")
 
     return calendar_plan
+
 
 def optimize_employee_assignment(network, position_employee_map, employee_schedule, days_off_map, start_date):
     """
