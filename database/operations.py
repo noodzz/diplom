@@ -108,29 +108,187 @@ def add_project_task(project_id, name, duration, position, required_employees=1)
         session.close()
 
 
-def add_task_dependencies(task_id, predecessor_id):
+def add_task_dependencies(project_id, task_name, predecessor_names):
     """
-    Добавляет зависимость между задачами.
+    Добавляет зависимости между задачами более надежным способом.
 
     Args:
-        task_id: ID зависимой задачи
-        predecessor_id: ID предшествующей задачи
+        project_id: ID проекта
+        task_name: Название задачи, для которой добавляются зависимости
+        predecessor_names: Список названий предшествующих задач
 
     Returns:
-        ID созданной зависимости
+        bool: Успех операции
     """
     session = Session()
     try:
-        dependency = TaskDependency(
-            task_id=task_id,
-            predecessor_id=predecessor_id
-        )
-        session.add(dependency)
+        # 1. Находим задачу по имени в рамках проекта
+        task = session.query(Task).filter(
+            Task.project_id == project_id,
+            Task.name == task_name
+        ).first()
+
+        if not task:
+            logger.error(f"Задача '{task_name}' не найдена в проекте {project_id}")
+            return False
+
+        # 2. Находим все предшествующие задачи
+        for pred_name in predecessor_names:
+            # Поиск с учетом возможных вариаций имен задач
+            pred_name = pred_name.strip()
+            if not pred_name:
+                continue
+
+            predecessor = session.query(Task).filter(
+                Task.project_id == project_id,
+                # Используем LIKE для более гибкого поиска
+                Task.name.like(f"{pred_name}%")
+            ).first()
+
+            if not predecessor:
+                logger.warning(f"Предшествующая задача '{pred_name}' не найдена, пропускаем")
+                continue
+
+            # 3. Проверяем, нет ли уже такой зависимости
+            existing_dependency = session.query(TaskDependency).filter(
+                TaskDependency.task_id == task.id,
+                TaskDependency.predecessor_id == predecessor.id
+            ).first()
+
+            if existing_dependency:
+                logger.info(f"Зависимость {task.name} -> {predecessor.name} уже существует")
+                continue
+
+            # 4. Создаем зависимость
+            dependency = TaskDependency(
+                task_id=task.id,
+                predecessor_id=predecessor.id
+            )
+            session.add(dependency)
+            logger.info(f"Добавлена зависимость: {task.name} зависит от {predecessor.name}")
+
         session.commit()
-        return dependency.id
+        return True
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при добавлении зависимостей: {str(e)}")
+        return False
+
     finally:
         session.close()
 
+
+def get_task_dependencies(project_id):
+    """
+    Получает все зависимости между задачами в проекте.
+
+    Args:
+        project_id: ID проекта
+
+    Returns:
+        dict: Словарь {task_id: [predecessor_ids]}
+    """
+    session = Session()
+    try:
+        dependencies = {}
+
+        # Получаем все задачи проекта
+        tasks = session.query(Task).filter(Task.project_id == project_id).all()
+
+        # Создаем словарь ID -> имя для всех задач проекта
+        task_id_to_name = {task.id: task.name for task in tasks}
+
+        # Получаем все зависимости
+        all_dependencies = session.query(TaskDependency).join(
+            Task, TaskDependency.task_id == Task.id
+        ).filter(
+            Task.project_id == project_id
+        ).all()
+
+        # Группируем зависимости по task_id
+        for dep in all_dependencies:
+            if dep.task_id not in dependencies:
+                dependencies[dep.task_id] = []
+            dependencies[dep.task_id].append(dep.predecessor_id)
+
+            # Логируем зависимость для отладки
+            task_name = task_id_to_name.get(dep.task_id, "Неизвестная задача")
+            pred_name = task_id_to_name.get(dep.predecessor_id, "Неизвестная задача")
+            logger.debug(f"Зависимость: {task_name} -> {pred_name}")
+
+        return dependencies
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении зависимостей: {str(e)}")
+        return {}
+
+    finally:
+        session.close()
+
+
+def check_circular_dependencies(project_id):
+    """
+    Проверяет наличие циклических зависимостей в проекте.
+
+    Args:
+        project_id: ID проекта
+
+    Returns:
+        tuple: (bool, list) - Наличие циклов и список задач в цикле
+    """
+    session = Session()
+    try:
+        # Получаем словарь зависимостей
+        dependencies = get_task_dependencies(project_id)
+        if not dependencies:
+            return False, []
+
+        # Словарь ID -> имя для всех задач проекта
+        tasks = session.query(Task).filter(Task.project_id == project_id).all()
+        task_id_to_name = {task.id: task.name for task in tasks}
+
+        # Алгоритм поиска циклов в графе (DFS)
+        visited = {}  # 0 = не посещена, 1 = в процессе, 2 = посещена
+        path = []  # Текущий путь для отслеживания цикла
+        cycle_found = [False]  # Используем список для изменения из вложенной функции
+        cycle_path = []  # Путь, образующий цикл
+
+        def dfs(node):
+            if node in visited:
+                if visited[node] == 1:  # Найден цикл
+                    cycle_found[0] = True
+                    # Сохраняем путь цикла
+                    cycle_path.extend([task_id_to_name.get(n, str(n)) for n in path])
+                    return
+                return
+
+            visited[node] = 1  # Помечаем как "в процессе"
+            path.append(node)
+
+            for neighbor in dependencies.get(node, []):
+                dfs(neighbor)
+                if cycle_found[0]:
+                    return
+
+            path.pop()
+            visited[node] = 2  # Помечаем как "посещена"
+
+        # Запускаем DFS из всех непосещенных узлов
+        for node in dependencies:
+            if node not in visited:
+                dfs(node)
+                if cycle_found[0]:
+                    return True, cycle_path
+
+        return False, []
+
+    except Exception as e:
+        logger.error(f"Ошибка при проверке циклических зависимостей: {str(e)}")
+        return False, []
+
+    finally:
+        session.close()
 
 def add_project_employee(name, position, days_off, email=None, project_id=None):
     """

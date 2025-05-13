@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ContextTypes, ConversationHandler
@@ -9,7 +9,7 @@ from bot.keyboards import (
     main_menu_keyboard, project_type_keyboard, templates_keyboard,
     task_actions_keyboard, dependencies_actions_keyboard,
     employees_actions_keyboard, plan_actions_keyboard, projects_keyboard,
-    position_selection_keyboard
+    position_selection_keyboard, back_to_main_keyboard
 )
 from bot.messages import (
     WELCOME_MESSAGE, HELP_MESSAGE, SELECT_PROJECT_TYPE_MESSAGE,
@@ -18,13 +18,14 @@ from bot.messages import (
     PLAN_CALCULATION_START, EXPORT_TO_JIRA_SUCCESS, CSV_FORMAT_ERROR, MY_ID_MESSAGE
 )
 from config import ALLOWED_USERS
-from database.models import AllowedUser, Employee, DayOff, Project, Task, TaskDependency, DayOff, ProjectTemplate, TaskTemplate, \
-    TaskTemplateDependency
+from database.models import AllowedUser, Employee, DayOff, Project, Task, TaskDependency, DayOff, ProjectTemplate, \
+    TaskTemplate, \
+    TaskTemplateDependency, TaskPart
 from database.operations import (
     create_new_project, add_project_task, add_task_dependencies,
     add_project_employee, add_employee_to_project, get_project_data, get_employees_by_position,
     get_project_templates, create_project_from_template, get_user_projects, get_allowed_users, add_allowed_user,
-    is_user_allowed, session_scope, get_all_positions, Session
+    is_user_allowed, session_scope, get_all_positions, Session, check_circular_dependencies, get_task_dependencies
 )
 from utils.csv_import import create_project_from_csv, parse_csv_tasks, create_project_from_tasks
 from planning.network import calculate_network_parameters
@@ -35,6 +36,7 @@ from bot.telegram_helpers import safe_edit_message_text
 import telegram
 import io
 import csv
+from datetime import datetime, timedelta
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,8 +186,6 @@ async def set_project_start_date(update: Update, context: ContextTypes.DEFAULT_T
 
 async def process_start_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process the start date input from user."""
-    from datetime import datetime, timedelta
-    import calendar
 
     if update.callback_query:
         query = update.callback_query
@@ -534,180 +534,525 @@ async def create_project(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BotStates.ADD_TASK
 
 
+def create_parent_child_tasks(project_id, task_data):
+    """
+    Создает родительские и дочерние задачи более надежным способом.
+
+    Args:
+        project_id: ID проекта
+        task_data: Словарь с данными задачи
+
+    Returns:
+        tuple: (parent_task_id, [subtask_ids])
+    """
+    session = Session()
+    try:
+        # Определяем, является ли задача групповой
+        has_multiple_roles = task_data.get('has_multiple_roles', False)
+        required_employees = task_data.get('required_employees', 1)
+        is_group_task = has_multiple_roles or required_employees > 1
+
+        # Если это не групповая задача, создаем обычную задачу
+        if not is_group_task:
+            task = Task(
+                project_id=project_id,
+                name=task_data['name'],
+                duration=task_data['duration'],
+                position=task_data.get('position', ''),
+                required_employees=1
+            )
+            session.add(task)
+            session.commit()
+            logger.info(f"Создана обычная задача: {task.name} (ID: {task.id})")
+            return task.id, []
+
+        # Создаем родительскую задачу
+        parent_task = Task(
+            project_id=project_id,
+            name=task_data['name'],
+            duration=task_data['duration'],
+            position='',  # У родительской задачи нет позиции
+            required_employees=required_employees,
+            sequential_subtasks=task_data.get('sequential_subtasks', False)
+        )
+        session.add(parent_task)
+        session.flush()  # Получаем ID без коммита
+
+        subtask_ids = []
+
+        # Создаем подзадачи в зависимости от типа групповой задачи
+        if has_multiple_roles and task_data.get('assignee_roles'):
+            # Создаем подзадачи для разных ролей
+            for i, role in enumerate(task_data['assignee_roles']):
+                position = role['position']
+                duration = role['duration']
+
+                subtask_name = f"{task_data['name']} - {position}"
+                subtask = Task(
+                    project_id=project_id,
+                    name=subtask_name,
+                    duration=duration,
+                    position=position,
+                    required_employees=1,
+                    parent_id=parent_task.id
+                )
+                session.add(subtask)
+                session.flush()
+                subtask_ids.append(subtask.id)
+
+                # Создаем запись в TaskPart для отслеживания частей задачи
+                task_part = TaskPart(
+                    task_id=parent_task.id,
+                    name=subtask_name,
+                    position=position,
+                    duration=duration,
+                    order=i + 1,
+                    required_employees=1
+                )
+                session.add(task_part)
+
+                logger.info(f"Создана подзадача с разной ролью: {subtask.name} (ID: {subtask.id})")
+
+            # Если подзадачи должны выполняться последовательно, создаем зависимости между ними
+            if parent_task.sequential_subtasks and len(subtask_ids) > 1:
+                for i in range(1, len(subtask_ids)):
+                    task_dependency = TaskDependency(
+                        task_id=subtask_ids[i],
+                        predecessor_id=subtask_ids[i - 1]
+                    )
+                    session.add(task_dependency)
+                    logger.info(
+                        f"Создана последовательная зависимость между подзадачами: {subtask_ids[i - 1]} -> {subtask_ids[i]}")
+
+        elif required_employees > 1:
+            # Создаем подзадачи для нескольких исполнителей одной должности
+            position = task_data.get('position', '')
+
+            for i in range(required_employees):
+                subtask_name = f"{task_data['name']} - Исполнитель {i + 1}"
+                subtask = Task(
+                    project_id=project_id,
+                    name=subtask_name,
+                    duration=task_data['duration'],
+                    position=position,
+                    required_employees=1,
+                    parent_id=parent_task.id
+                )
+                session.add(subtask)
+                session.flush()
+                subtask_ids.append(subtask.id)
+
+                logger.info(f"Создана подзадача для исполнителя {i + 1}: {subtask.name} (ID: {subtask.id})")
+
+            # Если подзадачи должны выполняться последовательно, создаем зависимости между ними
+            if parent_task.sequential_subtasks and len(subtask_ids) > 1:
+                for i in range(1, len(subtask_ids)):
+                    task_dependency = TaskDependency(
+                        task_id=subtask_ids[i],
+                        predecessor_id=subtask_ids[i - 1]
+                    )
+                    session.add(task_dependency)
+                    logger.info(
+                        f"Создана последовательная зависимость между подзадачами: {subtask_ids[i - 1]} -> {subtask_ids[i]}")
+
+        session.commit()
+        logger.info(
+            f"Создана родительская задача: {parent_task.name} (ID: {parent_task.id}) с {len(subtask_ids)} подзадачами")
+        return parent_task.id, subtask_ids
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Ошибка при создании родительской/дочерних задач: {str(e)}")
+        return None, []
+
+    finally:
+        session.close()
+
+
+def get_task_hierarchy(project_id):
+    """
+    Получает иерархию задач проекта, группируя подзадачи по родительским задачам.
+
+    Args:
+        project_id: ID проекта
+
+    Returns:
+        dict: Словарь {parent_task: {info: parent_info, subtasks: [subtask_info]}}
+    """
+    session = Session()
+    try:
+        hierarchy = {}
+
+        # Получаем все задачи проекта
+        all_tasks = session.query(Task).filter(Task.project_id == project_id).all()
+
+        # Находим родительские задачи и обычные задачи
+        for task in all_tasks:
+            # Если это родительская задача или у нее есть подзадачи
+            if task.required_employees > 1 or task.subtasks:
+                # Получаем подзадачи для этой задачи
+                subtasks = session.query(Task).filter(
+                    Task.parent_id == task.id
+                ).all()
+
+                # Преобразуем задачу в словарь
+                task_dict = {
+                    'id': task.id,
+                    'name': task.name,
+                    'duration': task.duration,
+                    'position': task.position or '',
+                    'required_employees': task.required_employees,
+                    'sequential_subtasks': task.sequential_subtasks,
+                    'is_parent': True
+                }
+
+                # Преобразуем подзадачи в словари
+                subtasks_list = []
+                for subtask in subtasks:
+                    subtask_dict = {
+                        'id': subtask.id,
+                        'name': subtask.name,
+                        'duration': subtask.duration,
+                        'position': subtask.position or '',
+                        'required_employees': subtask.required_employees,
+                        'parent_id': task.id,
+                        'is_subtask': True
+                    }
+                    subtasks_list.append(subtask_dict)
+
+                # Добавляем в иерархию
+                hierarchy[task.id] = {
+                    'task': task_dict,
+                    'subtasks': subtasks_list
+                }
+
+        # Находим обычные задачи (не родительские и не подзадачи)
+        standalone_tasks = []
+        for task in all_tasks:
+            # Пропускаем подзадачи
+            if task.parent_id is not None:
+                continue
+
+            # Пропускаем родительские задачи, которые уже обработаны
+            if task.id in hierarchy:
+                continue
+
+            # Преобразуем обычную задачу в словарь
+            task_dict = {
+                'id': task.id,
+                'name': task.name,
+                'duration': task.duration,
+                'position': task.position or '',
+                'required_employees': task.required_employees,
+                'is_parent': False,
+                'is_subtask': False
+            }
+            standalone_tasks.append(task_dict)
+
+        # Добавляем обычные задачи в результат
+        hierarchy['standalone'] = standalone_tasks
+
+        return hierarchy
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении иерархии задач: {str(e)}")
+        return {'standalone': []}
+
+    finally:
+        session.close()
+
+
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик добавления задачи."""
-    # Check if this is a callback query
+    logger.info("Начало обработки add_task")
+
+    # Проверка на callback_query
     if update.callback_query:
         query = update.callback_query
         await query.answer()
 
-        # Handle callback - might be navigational
+        # Обработка навигационных действий
         if query.data == "add_task":
             await query.edit_message_text(
                 "Добавьте информацию о задаче в формате:\n"
-                "<название задачи> | <длительность в днях> | <должность исполнителя>\n\n"
-                "Например: Создание тарифов обучения | 1 | Технический специалист",
+                "<название задачи> | <длительность в днях> | <должность исполнителя> | <количество исполнителей> | <последовательное выполнение>\n\n"
+                "Например: Создание тарифов обучения | 1 | Технический специалист | 1 | нет\n\n"
+                "Для создания задачи с разными ролями используйте формат:\n"
+                "<название задачи> | <длительность> | роли | <роль1>:<длительность1>,<роль2>:<длительность2> | <последовательное выполнение>\n\n"
+                "Например: Настройка системы | 3 | роли | Технический специалист:1,Старший технический специалист:2 | да",
                 reply_markup=task_actions_keyboard()
             )
+        elif query.data == "goto_dependencies":
+            return await show_dependencies(update, context)
+        elif query.data == "back_to_project":
+            return await select_project(update, context)
+
         return BotStates.ADD_TASK
 
-    # If we have a text message with task details
+    # Обработка текстового сообщения с информацией о задаче
     if not update.message or not update.message.text:
         logger.error("Получен пустой текст сообщения в add_task")
         return BotStates.ADD_TASK
-    task_data = update.message.text.split('|')
 
-    if len(task_data) != 3:
+    message_text = update.message.text
+    task_parts = [part.strip() for part in message_text.split('|')]
+
+    # Проверяем формат сообщения
+    if len(task_parts) < 3:
         await update.message.reply_text(
-            f"Неверный формат. Пожалуйста, используйте формат:\n{ADD_TASK_PROMPT}"
+            "Неверный формат. Используйте:\n"
+            "<название задачи> | <длительность> | <должность> | [количество] | [последовательно]\n\n"
+            "Или для задач с разными ролями:\n"
+            "<название задачи> | <длительность> | роли | <роль1>:<длит1>,<роль2>:<длит2> | [последовательно]"
         )
         return BotStates.ADD_TASK
 
-    task_name = task_data[0].strip()
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await update.message.reply_text(
+            "Ошибка: проект не выбран. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Разбираем данные задачи
+    task_name = task_parts[0]
+
     try:
-        duration = int(task_data[1].strip())
+        duration = int(task_parts[1])
+        if duration <= 0:
+            await update.message.reply_text("Длительность должна быть положительным числом.")
+            return BotStates.ADD_TASK
     except ValueError:
-        await update.message.reply_text("Длительность должна быть целым числом дней.")
+        await update.message.reply_text("Длительность должна быть числом.")
         return BotStates.ADD_TASK
 
-    position = task_data[2].strip()
+    # Определяем тип задачи
+    if task_parts[2].lower() == 'роли' and len(task_parts) >= 4:
+        # Задача с разными ролями
+        has_multiple_roles = True
+        roles_text = task_parts[3]
 
-    # Добавляем задачу в БД
-    project_id = context.user_data['current_project_id']
-    task_id = add_project_task(project_id, task_name, duration, position, required_employees=1)
+        # Парсим роли и их длительности
+        assignee_roles = []
+        for role_part in roles_text.split(','):
+            if ':' in role_part:
+                position, role_duration = role_part.split(':')
+                try:
+                    assignee_roles.append({
+                        "position": position.strip(),
+                        "duration": int(role_duration.strip())
+                    })
+                except ValueError:
+                    await update.message.reply_text(f"Неверный формат длительности роли: {role_part}")
+                    return BotStates.ADD_TASK
 
-    # Сохраняем задачу в контексте
-    if 'tasks' not in context.user_data:
-        context.user_data['tasks'] = []
-    context.user_data['tasks'].append({
-        'id': task_id,
-        'name': task_name,
-        'duration': duration,
-        'position': position
-    })
+        if not assignee_roles:
+            await update.message.reply_text(
+                "Не удалось распознать роли. Используйте формат: роль1:длительность1,роль2:длительность2")
+            return BotStates.ADD_TASK
 
-    await update.message.reply_text(
-        f"Задача '{task_name}' добавлена. Добавьте еще задачу или перейдите к указанию зависимостей.",
-        reply_markup=task_actions_keyboard()
-    )
+        # Определяем, последовательно ли выполняются подзадачи
+        sequential = False
+        if len(task_parts) >= 5:
+            sequential_text = task_parts[4].lower()
+            sequential = sequential_text in ['да', 'true', '1', 'yes', 'последовательно']
+
+        # Создаем данные задачи
+        task_data = {
+            'name': task_name,
+            'duration': duration,
+            'position': '',
+            'required_employees': 1,
+            'has_multiple_roles': True,
+            'assignee_roles': assignee_roles,
+            'sequential_subtasks': sequential
+        }
+    else:
+        # Обычная задача или задача с несколькими исполнителями одной должности
+        position = task_parts[2]
+
+        # Определяем количество исполнителей
+        required_employees = 1
+        if len(task_parts) >= 4:
+            try:
+                required_employees = int(task_parts[3])
+                if required_employees <= 0:
+                    required_employees = 1
+            except ValueError:
+                # Если не число, считаем что это 1
+                required_employees = 1
+
+        # Определяем, последовательно ли выполняются подзадачи
+        sequential = False
+        if len(task_parts) >= 5:
+            sequential_text = task_parts[4].lower()
+            sequential = sequential_text in ['да', 'true', '1', 'yes', 'последовательно']
+
+        # Создаем данные задачи
+        task_data = {
+            'name': task_name,
+            'duration': duration,
+            'position': position,
+            'required_employees': required_employees,
+            'has_multiple_roles': False,
+            'sequential_subtasks': sequential
+        }
+
+    # Создаем задачу (и подзадачи, если нужно)
+    parent_id, subtask_ids = create_parent_child_tasks(project_id, task_data)
+
+    if parent_id:
+        # Формируем сообщение об успешном создании
+        if subtask_ids:
+            roles_info = ""
+            if task_data.get('has_multiple_roles'):
+                roles = [f"{role['position']} ({role['duration']} дн.)" for role in task_data.get('assignee_roles', [])]
+                roles_info = "\nРоли: " + ", ".join(roles)
+
+            await update.message.reply_text(
+                f"✅ Задача '{task_name}' успешно создана с {len(subtask_ids)} подзадачами.\n"
+                f"Общая длительность: {duration} дн.{roles_info}\n"
+                f"Последовательное выполнение: {'Да' if task_data.get('sequential_subtasks') else 'Нет'}",
+                reply_markup=task_actions_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Задача '{task_name}' успешно создана.\n"
+                f"Длительность: {duration} дн., Должность: {task_data.get('position', '')}",
+                reply_markup=task_actions_keyboard()
+            )
+
+        # Обновляем список задач в контексте
+        if 'tasks' not in context.user_data:
+            context.user_data['tasks'] = []
+
+        # Добавляем задачу в контекст
+        context.user_data['tasks'].append({
+            'id': parent_id,
+            'name': task_name,
+            'duration': duration,
+            'position': task_data.get('position', ''),
+            'required_employees': task_data.get('required_employees', 1),
+            'has_multiple_roles': task_data.get('has_multiple_roles', False)
+        })
+    else:
+        await update.message.reply_text(
+            f"❌ Ошибка при создании задачи '{task_name}'. Пожалуйста, попробуйте еще раз.",
+            reply_markup=task_actions_keyboard()
+        )
+
     return BotStates.ADD_TASK
 
 async def add_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик добавления зависимостей между задачами."""
-    logger.info(
-        f"add_dependencies handler called, update type: {'callback_query' if update.callback_query else 'message'}")
+    logger.info("Начало обработки add_dependencies")
 
     # Обработка callback_query (нажатие на кнопку)
     if update.callback_query:
         query = update.callback_query
         await query.answer()
 
-        if query.data == 'next':
-            logger.info("'Далее: Сотрудники' button pressed, redirecting to ADD_EMPLOYEES state")
+        if query.data == 'goto_employees':
+            logger.info("Переходим к добавлению сотрудников")
+            # Переход к следующему этапу - добавление сотрудников
+            return await show_employees(update, context)
 
-            # Получаем данные проекта для отображения информации о сотрудниках
+        elif query.data == 'back_to_tasks':
+            logger.info("Возвращаемся к добавлению задач")
+            return await back_to_tasks(update, context)
+
+        elif query.data == 'add_dependency':
+            # Показываем форму для добавления зависимости
             project_id = context.user_data.get('current_project_id')
             if not project_id:
-                logger.error("Project ID not found in context")
                 await query.edit_message_text(
-                    "Ошибка: не найден ID проекта. Пожалуйста, выберите проект заново.",
+                    "Ошибка: проект не выбран. Пожалуйста, вернитесь в главное меню.",
                     reply_markup=main_menu_keyboard()
                 )
                 return BotStates.MAIN_MENU
 
             project_data = get_project_data(project_id)
-
-            # Формируем сообщение о существующих сотрудниках
-            employees_text = ""
-            if project_data and project_data.get('employees'):
-                employees = project_data['employees']
-                employees_text = "Существующие сотрудники:\n"
-                for idx, employee in enumerate(employees, 1):
-                    days_off_str = ", ".join(employee.get('days_off', [])) if employee.get(
-                        'days_off') else "Без выходных"
-                    employees_text += f"{idx}. {employee['name']} | {employee['position']} | {days_off_str}\n"
-                employees_text += "\n"
-
-            try:
+            if not project_data or not project_data.get('tasks'):
                 await query.edit_message_text(
-                    f"{employees_text}Добавьте информацию о сотруднике в формате:\n"
-                    "<ФИО> | <должность> | <выходные дни через запятую>\n\n"
-                    "Например: Иванов Иван Иванович | Технический специалист | Суббота, Воскресенье",
-                    reply_markup=employees_actions_keyboard()
+                    "В проекте нет задач для добавления зависимостей.",
+                    reply_markup=back_to_main_keyboard()
                 )
-                logger.info("Successfully redirected to ADD_EMPLOYEES state")
-                return BotStates.ADD_EMPLOYEES
-            except Exception as e:
-                logger.error(f"Error editing message: {str(e)}")
-                # Если редактирование не удалось, отправляем новое сообщение
-                await query.message.reply_text(
-                    f"{employees_text}Добавьте информацию о сотруднике в формате:\n"
-                    "<ФИО> | <должность> | <выходные дни через запятую>\n\n"
-                    "Например: Иванов Иван Иванович | Технический специалист | Суббота, Воскресенье",
-                    reply_markup=employees_actions_keyboard()
-                )
-                return BotStates.ADD_EMPLOYEES
+                return BotStates.MAIN_MENU
 
-        elif query.data == 'back_to_tasks':
-            logger.info("Back button pressed, returning to ADD_TASK state")
-            return await back_to_tasks(update, context)
+            # Формируем сообщение со списком задач
+            tasks_list = "\n".join([f"{i + 1}. {task['name']}" for i, task in enumerate(project_data['tasks'])])
 
-        # Другие callback_data обработчики...
+            await query.edit_message_text(
+                f"Укажите зависимости в формате:\n<название задачи> | <зависимости через запятую>\n\n"
+                f"Например: Задача 2 | Задача 1, Задача 3\n\n"
+                f"Список задач:\n{tasks_list}",
+                reply_markup=dependencies_actions_keyboard()
+            )
+            return BotStates.ADD_DEPENDENCIES
 
         return BotStates.ADD_DEPENDENCIES
 
     # Обработка текстового сообщения с зависимостями
     if not update.message or not update.message.text:
-        logger.warning("Invalid message format received")
-        await update.message.reply_text(
-            f"Неверный формат. Пожалуйста, используйте формат:\n{ADD_DEPENDENCIES_PROMPT}"
+        await update.effective_chat.send_message(
+            "Пожалуйста, укажите зависимости в формате: <название задачи> | <зависимости через запятую>"
         )
         return BotStates.ADD_DEPENDENCIES
 
-    if '|' not in update.message.text:
-        logger.info("No dependencies specified, showing next button")
+    message_text = update.message.text
+
+    # Проверяем формат сообщения
+    if '|' not in message_text:
         await update.message.reply_text(
-            "Не указаны зависимости для задачи. Переходим к следующему этапу.",
+            "Неверный формат. Используйте: <название задачи> | <зависимости через запятую>",
             reply_markup=dependencies_actions_keyboard()
         )
         return BotStates.ADD_DEPENDENCIES
 
-    deps_data = update.message.text.split('|')
-    task_name = deps_data[0].strip()
+    # Разбираем сообщение
+    parts = message_text.split('|', 1)
+    task_name = parts[0].strip()
 
-    # Находим задачу по имени
-    task_id = None
-    for task in context.user_data.get('tasks', []):
-        if task['name'] == task_name:
-            task_id = task['id']
-            break
+    # Получаем список предшественников
+    predecessors = []
+    if len(parts) > 1 and parts[1].strip():
+        predecessors = [pred.strip() for pred in parts[1].split(',')]
 
-    if not task_id:
-        logger.warning(f"Task not found: {task_name}")
-        await update.message.reply_text(f"Задача '{task_name}' не найдена. Попробуйте снова.")
-        return BotStates.ADD_DEPENDENCIES
+    # Добавляем зависимости
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await update.message.reply_text(
+            "Ошибка: проект не выбран. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
 
-    # Парсим предшествующие задачи
-    if len(deps_data) > 1:
-        predecessors = [pred.strip() for pred in deps_data[1].split(',')]
+    # Используем улучшенную функцию добавления зависимостей
+    success = add_task_dependencies(project_id, task_name, predecessors)
 
-        # Находим ID предшествующих задач
-        predecessor_ids = []
-        for pred_name in predecessors:
-            for task in context.user_data['tasks']:
-                if task['name'] == pred_name:
-                    predecessor_ids.append(task['id'])
-                    break
+    if success:
+        # Проверяем наличие циклических зависимостей
+        has_cycles, cycle_path = check_circular_dependencies(project_id)
 
-        # Добавляем зависимости в БД
-        for pred_id in predecessor_ids:
-            add_task_dependencies(task_id, pred_id)
-            logger.info(f"Added dependency: Task {task_id} depends on {pred_id}")
+        if has_cycles:
+            await update.message.reply_text(
+                f"⚠️ Внимание! Обнаружена циклическая зависимость: {' -> '.join(cycle_path)}.\n"
+                f"Это может привести к проблемам при построении календарного плана.",
+                reply_markup=dependencies_actions_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ Зависимости для задачи '{task_name}' успешно добавлены.",
+                reply_markup=dependencies_actions_keyboard()
+            )
+    else:
+        await update.message.reply_text(
+            f"❌ Ошибка при добавлении зависимостей для задачи '{task_name}'.\n"
+            f"Возможно, задача не найдена или произошла другая ошибка.",
+            reply_markup=dependencies_actions_keyboard()
+        )
 
-    await update.message.reply_text(
-        f"Зависимости для задачи '{task_name}' добавлены. Добавьте еще зависимости или перейдите к добавлению сотрудников.",
-        reply_markup=dependencies_actions_keyboard()
-    )
     return BotStates.ADD_DEPENDENCIES
 
 async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -885,28 +1230,53 @@ async def add_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for calculating calendar plan."""
+    """Обработчик расчета календарного плана."""
     query = update.callback_query
     await query.answer()
 
-    await safe_edit_message_text(query, PLAN_CALCULATION_START)
+    await safe_edit_message_text(query, "Начинаю расчет оптимального календарного плана...")
 
-    # Get project data
-    project_id = context.user_data['current_project_id']
+    # Получаем данные проекта
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await query.edit_message_text(
+            "Ошибка: проект не выбран. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
     project_data = get_project_data(project_id)
+    if not project_data:
+        await query.edit_message_text(
+            "Ошибка: проект не найден. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
 
-    # If no employees in project, use employees from context
-    if not project_data['employees'] and 'employees' in context.user_data:
-        project_data['employees'] = context.user_data['employees']
+    # Проверяем наличие задач
+    if not project_data.get('tasks'):
+        await query.edit_message_text(
+            "В проекте нет задач для расчета календарного плана. Пожалуйста, добавьте задачи.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Добавить задачи", callback_data="add_tasks")
+            ]])
+        )
+        return BotStates.SELECT_PROJECT
 
-    # Calculate network parameters
-    network_parameters = calculate_network_parameters(project_data)
+    # Проверяем наличие циклических зависимостей
+    has_cycles, cycle_path = check_circular_dependencies(project_id)
+    if has_cycles:
+        await query.edit_message_text(
+            f"⚠️ Обнаружена циклическая зависимость: {' -> '.join(cycle_path)}.\n"
+            "Это препятствует построению календарного плана. Пожалуйста, исправьте зависимости.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("К зависимостям", callback_data="goto_dependencies"),
+                InlineKeyboardButton("Назад", callback_data="back_to_project")
+            ]])
+        )
+        return BotStates.SELECT_PROJECT
 
-    # Приоритет получения даты начала:
-    # 1. Из БД проекта
-    # 2. Из контекста
-    # 3. Сегодняшняя дата
-
+    # Определяем дату начала проекта
     start_date = None
 
     # Попытка получить дату из БД
@@ -916,55 +1286,52 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if hasattr(db_date, 'year'):  # Проверяем, является ли объектом date или datetime
             from datetime import datetime
             start_date = datetime.combine(db_date, datetime.min.time())
-            logger.info(f"Using project start date from database: {start_date}")
+            logger.info(f"Используем дату начала из БД: {start_date}")
 
     # Если нет даты в БД, смотрим в контекст
     if not start_date and 'project_start_date' in context.user_data:
         start_date = context.user_data['project_start_date']
-        logger.info(f"Using project start date from context: {start_date}")
+        logger.info(f"Используем дату начала из контекста: {start_date}")
 
-    # Если все еще нет даты, используем сегодняшнюю
+    # Если все еще нет даты, используем текущую
     if not start_date:
-        # Set default to today
         start_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         context.user_data['project_start_date'] = start_date
-        logger.info(f"No start date specified, using today: {start_date}")
+        logger.info(f"Используем текущую дату: {start_date}")
 
-    # Create calendar plan with days off and start date
-    calendar_plan = create_calendar_plan(network_parameters, project_data, start_date)
+    try:
+        # Рассчитываем параметры сетевой модели
+        network_parameters = calculate_network_parameters(project_data)
 
-    # Save results in context
-    context.user_data['calendar_plan'] = calendar_plan
+        # Создаем календарный план с учетом выходных и назначения сотрудников
+        calendar_plan = create_calendar_plan(network_parameters, project_data, start_date)
 
-    # Generate Gantt chart
-    gantt_image = generate_gantt_chart(calendar_plan)
-    gantt_buffer = io.BytesIO()
-    gantt_image.save(gantt_buffer, format='PNG')
-    gantt_buffer.seek(0)
+        # Сохраняем результаты в контексте
+        context.user_data['calendar_plan'] = calendar_plan
 
-    # Format start and end dates for the report
-    start_date_str = start_date.strftime('%d.%m.%Y')
+        # Генерируем диаграмму Ганта
+        gantt_image = generate_gantt_chart(calendar_plan)
+        gantt_buffer = io.BytesIO()
+        gantt_image.save(gantt_buffer, format='PNG')
+        gantt_buffer.seek(0)
 
-    # Calculate end date based on start date and project duration
-    if 'project_duration' in calendar_plan:
-        from datetime import timedelta
-        end_date = start_date + timedelta(days=calendar_plan['project_duration'])
+        # Формируем текстовый отчет
+        start_date_str = start_date.strftime('%d.%m.%Y')
+
+        # Расчет даты окончания
+        project_duration = calendar_plan.get('project_duration', 0)
+        end_date = start_date + timedelta(days=project_duration)
         end_date_str = end_date.strftime('%d.%m.%Y')
-    else:
-        end_date_str = "не определена"
 
-    # Form text report
-    if calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], dict):
-        critical_path_text = "Критический путь: " + " -> ".join(
-            [task['name'] for task in calendar_plan['critical_path']])
-    elif calendar_plan['critical_path'] and isinstance(calendar_plan['critical_path'][0], str):
-        critical_path_text = "Критический путь: " + " -> ".join(calendar_plan['critical_path'])
-    else:
-        critical_path_text = "Критический путь не определен"
+        # Формируем критический путь
+        critical_path_text = ""
+        if calendar_plan.get('critical_path'):
+            critical_path_names = [task['name'] for task in calendar_plan['critical_path']]
+            critical_path_text = "Критический путь: " + " -> ".join(critical_path_names)
+        else:
+            critical_path_text = "Критический путь не определен"
 
-    project_duration = calendar_plan['project_duration']
-
-    report = f"""
+        report = f"""
 Расчет календарного плана завершен!
 
 Дата начала проекта: {start_date_str}
@@ -976,23 +1343,49 @@ async def calculate_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Резервы времени для некритических работ:
 """
 
-    for task in calendar_plan['tasks']:
-        if task['is_critical']:
-            continue
-        report += f"- {task['name']}: {task['reserve']} дней\n"
+        # Добавляем информацию о резервах для некритических задач
+        tasks_with_reserves = [task for task in calendar_plan['tasks'] if
+                               not task.get('is_critical') and task.get('reserve', 0) > 0]
+        if tasks_with_reserves:
+            for task in sorted(tasks_with_reserves, key=lambda t: t.get('reserve', 0), reverse=True):
+                report += f"- {task['name']}: {task.get('reserve', 0)} дней\n"
+        else:
+            report += "Нет задач с резервами времени.\n"
 
-    # Send report and diagram
-    await query.message.reply_photo(
-        photo=gantt_buffer,
-        caption="Диаграмма Ганта для календарного плана"
-    )
+        # Отправляем диаграмму Ганта и отчет
+        await query.message.reply_photo(
+            photo=gantt_buffer,
+            caption="Диаграмма Ганта для календарного плана"
+        )
 
-    await query.message.reply_text(
-        report,
-        reply_markup=plan_actions_keyboard()
-    )
+        await query.message.reply_text(
+            report,
+            reply_markup=plan_actions_keyboard()
+        )
 
-    return BotStates.SHOW_PLAN
+        return BotStates.SHOW_PLAN
+
+    except Exception as e:
+        logger.error(f"Ошибка при расчете календарного плана: {str(e)}")
+
+        # Более подробное сообщение об ошибке
+        error_msg = f"Произошла ошибка при расчете календарного плана: {str(e)}\n\n"
+
+        if "cycle" in str(e).lower() or "цикл" in str(e).lower():
+            error_msg += "Обнаружена циклическая зависимость между задачами. Пожалуйста, проверьте зависимости задач."
+        else:
+            error_msg += "Пожалуйста, проверьте корректность данных проекта и попробуйте снова."
+
+        await query.edit_message_text(
+            error_msg,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("К зависимостям", callback_data="goto_dependencies"),
+                InlineKeyboardButton("Назад", callback_data="back_to_project")
+            ]])
+        )
+
+        return BotStates.SELECT_PROJECT
+
 
 async def export_to_jira(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик экспорта задач в Jira."""
@@ -1753,48 +2146,14 @@ async def back_to_dependencies(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def back_to_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for going back to employees."""
-    logger.info("Starting back_to_employees handler")
+    """Обработчик возврата к списку сотрудников."""
+    logger.info("Начало обработки back_to_employees")
+
     query = update.callback_query
     await query.answer()
 
-    project_id = context.user_data.get('current_project_id')
-    if not project_id:
-        await query.edit_message_text(
-            "Ошибка: проект не найден. Пожалуйста, выберите проект заново.",
-            reply_markup=main_menu_keyboard()
-        )
-        return BotStates.MAIN_MENU
-
-    # Get project data
-    project_data = get_project_data(project_id)
-    if not project_data:
-        await query.edit_message_text(
-            "Проект не найден или был удален.",
-            reply_markup=main_menu_keyboard()
-        )
-        return BotStates.MAIN_MENU
-
-    # Create message about employees
-    message = f"📊 *Проект: {project_data['name']}*\n\n"
-    message += f"*Сотрудники:* {len(project_data['employees'])}\n\n"
-
-    if project_data['employees']:
-        message += "*Список сотрудников:*\n"
-        for i, employee in enumerate(project_data['employees'], 1):
-            days_off_str = ", ".join(employee['days_off']) if employee['days_off'] else "Без выходных"
-            message += f"{i}. {employee['name']} - {employee['position']} (Выходные: {days_off_str})\n"
-    else:
-        message += "Сотрудники еще не добавлены.\n"
-
-    message += "\nВыберите действие:"
-
-    await query.edit_message_text(
-        message,
-        reply_markup=employees_actions_keyboard(),
-        parse_mode='Markdown'
-    )
-    return BotStates.ADD_EMPLOYEES
+    # Возвращаемся к показу сотрудников
+    return await show_employees(update, context)
 
 async def back_to_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик возврата к просмотру плана проекта."""
@@ -2230,31 +2589,43 @@ async def add_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for showing available positions."""
-    logger.info("Starting show_positions handler")
+    """Показывает список доступных должностей для выбора."""
+    logger.info("Начало обработки show_positions")
+
     query = update.callback_query
     await query.answer()
 
-    # Get all positions
+    # Получаем список всех возможных должностей
     positions = get_all_positions()
 
     if not positions:
-        await safe_edit_message_text(
-            query,
-            "В базе данных нет сохраненных должностей. Пожалуйста, добавьте сотрудника вручную.",
+        await query.edit_message_text(
+            "В базе данных нет должностей. Необходимо сначала добавить сотрудников.",
             reply_markup=employees_actions_keyboard()
         )
         return BotStates.ADD_EMPLOYEES
 
-    # Save positions in context
+    # Сохраняем список должностей в контексте
     context.user_data['available_positions'] = positions
 
-    # Show position selection
-    await safe_edit_message_text(
-        query,
-        "Выберите должность сотрудника:",
-        reply_markup=position_selection_keyboard(positions)
+    # Формируем сообщение
+    message = "Выберите должность сотрудника:\n\n"
+
+    # Создаем клавиатуру с должностями
+    keyboard = []
+    for position in positions:
+        # Вычисляем хеш должности для идентификации в callback_data
+        position_hash = str(hash(position) % 1000000)
+        keyboard.append([InlineKeyboardButton(position, callback_data=f"pos_{position_hash}")])
+
+    # Добавляем кнопку "Назад"
+    keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_employees")])
+
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
     return BotStates.SELECT_POSITION
 
 
@@ -2527,57 +2898,150 @@ async def assign_all_employees_callback(update: Update, context: ContextTypes.DE
 
 
 async def show_dependencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обработчик для перехода к добавлению зависимостей.
-    """
-    logger.info("show_dependencies handler called")
+    """Отображает существующие зависимости между задачами проекта."""
+    logger.info("Начало обработки show_dependencies")
+
     query = update.callback_query
     await query.answer()
 
+    # Получаем ID проекта
     project_id = context.user_data.get('current_project_id')
     if not project_id:
-        logger.error("Project ID not found in context")
         await query.edit_message_text(
-            "Ошибка: не найден ID проекта. Пожалуйста, выберите проект заново.",
+            "Ошибка: проект не выбран. Пожалуйста, вернитесь в главное меню.",
             reply_markup=main_menu_keyboard()
         )
         return BotStates.MAIN_MENU
 
-    # Получаем задачи проекта для отображения
+    # Получаем данные проекта и зависимости
     project_data = get_project_data(project_id)
+    dependencies = get_task_dependencies(project_id)
 
-    if not project_data or not project_data['tasks']:
-        logger.warning("No tasks found for dependencies")
+    if not project_data or not project_data.get('tasks'):
         await query.edit_message_text(
-            "В проекте нет задач для добавления зависимостей. Сначала добавьте задачи.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")]
-            ])
+            "В проекте нет задач для отображения зависимостей.",
+            reply_markup=back_to_main_keyboard()
         )
-        return BotStates.SELECT_PROJECT
+        return BotStates.MAIN_MENU
 
-    # Создаем сообщение с инструкцией и списком задач
-    message = "Укажите зависимости между задачами в формате:\n"
-    message += "<название задачи> | <название предшествующей задачи1>, <название предшествующей задачи2>, ...\n\n"
-    message += "Список существующих задач:\n"
+    # Создаем словарь id -> задача для быстрого доступа
+    tasks_by_id = {task['id']: task for task in project_data['tasks']}
 
-    # Показываем список задач
-    for i, task in enumerate(project_data['tasks'], 1):
-        message += f"{i}. {task['name']}\n"
+    # Формируем список зависимостей в читаемом виде
+    message = f"📋 *Зависимости в проекте \"{project_data['name']}\"*\n\n"
 
-    # Отправляем сообщение с клавиатурой
+    if not dependencies:
+        message += "В проекте нет зависимостей между задачами.\n"
+    else:
+        for task_id, predecessors in dependencies.items():
+            if task_id not in tasks_by_id:
+                continue
+
+            task_name = tasks_by_id[task_id]['name']
+            message += f"• *{task_name}* зависит от:\n"
+
+            for pred_id in predecessors:
+                if pred_id in tasks_by_id:
+                    pred_name = tasks_by_id[pred_id]['name']
+                    message += f"  - {pred_name}\n"
+
+    # Проверяем наличие циклических зависимостей
+    has_cycles, cycle_path = check_circular_dependencies(project_id)
+    if has_cycles:
+        message += f"\n⚠️ *Обнаружена циклическая зависимость*:\n{' -> '.join(cycle_path)}\n"
+        message += "Это может привести к проблемам при построении календарного плана.\n"
+
+    # Создаем клавиатуру с действиями
+    keyboard = [
+        [InlineKeyboardButton("Добавить зависимость", callback_data="add_dependency")],
+        [InlineKeyboardButton("К добавлению сотрудников", callback_data="goto_employees")],
+        [InlineKeyboardButton("Назад к задачам", callback_data="back_to_tasks")],
+        [InlineKeyboardButton("Главное меню", callback_data="main_menu")]
+    ]
+
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+
+    return BotStates.ADD_DEPENDENCIES
+
+
+async def show_employees(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список сотрудников проекта и предлагает добавить нового."""
+    logger.info("Начало обработки show_employees")
+
+    query = update.callback_query
+    await query.answer()
+
+    # Получаем ID проекта
+    project_id = context.user_data.get('current_project_id')
+    if not project_id:
+        await query.edit_message_text(
+            "Ошибка: проект не выбран. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Получаем данные проекта
+    project_data = get_project_data(project_id)
+    if not project_data:
+        await query.edit_message_text(
+            "Ошибка: проект не найден. Пожалуйста, вернитесь в главное меню.",
+            reply_markup=main_menu_keyboard()
+        )
+        return BotStates.MAIN_MENU
+
+    # Формируем сообщение со списком сотрудников
+    message = f"📋 *Сотрудники проекта \"{project_data['name']}\"*\n\n"
+
+    if not project_data.get('employees'):
+        message += "В проекте еще нет сотрудников.\n\n"
+    else:
+        message += "*Текущие сотрудники:*\n"
+        for i, employee in enumerate(project_data['employees'], 1):
+            days_off_str = ", ".join(employee.get('days_off', [])) if employee.get('days_off') else "Без выходных"
+            message += f"{i}. *{employee['name']}* - {employee['position']}\n   Выходные: {days_off_str}\n"
+
+    # Добавляем информацию о необходимых должностях
+    required_positions = set()
+    for task in project_data.get('tasks', []):
+        if task.get('position'):
+            required_positions.add(task['position'])
+
+    if required_positions:
+        message += "\n*Необходимые должности в проекте:*\n"
+        for position in sorted(required_positions):
+            message += f"- {position}\n"
+
+    # Создаем клавиатуру с действиями
+    keyboard = [
+        [InlineKeyboardButton("Добавить сотрудника", callback_data="add_employee")],
+        [InlineKeyboardButton("Выбрать по должности", callback_data="show_positions")],
+        [InlineKeyboardButton("Назначить всех сотрудников", callback_data="assign_all_employees")],
+        [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
+        [InlineKeyboardButton("Назад к зависимостям", callback_data="back_to_dependencies")],
+        [InlineKeyboardButton("Назад к проекту", callback_data="back_to_project")],
+        [InlineKeyboardButton("Главное меню", callback_data="main_menu")]
+    ]
+
     try:
         await query.edit_message_text(
             message,
-            reply_markup=dependencies_actions_keyboard()
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
         )
-        logger.info("Dependencies screen displayed successfully")
-        return BotStates.ADD_DEPENDENCIES
     except Exception as e:
-        logger.error(f"Error showing dependencies: {str(e)}")
-        # В случае ошибки отправляем новое сообщение
+        logger.error(f"Ошибка при отображении сотрудников: {str(e)}")
+        # В случае ошибки (например, слишком длинное сообщение) отправляем новое
         await query.message.reply_text(
-            message,
-            reply_markup=dependencies_actions_keyboard()
+            "Список сотрудников проекта",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return BotStates.ADD_DEPENDENCIES
+
+    return BotStates.ADD_EMPLOYEES
+
+
+
+

@@ -27,12 +27,15 @@ def dependencies_actions_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# Обновленная функция keyboards.py для совместимости с остальным кодом
 def employees_actions_keyboard():
     """Клавиатура действий с сотрудниками."""
     keyboard = [
         [InlineKeyboardButton("Добавить еще сотрудника", callback_data="add_employee")],
+        [InlineKeyboardButton("Назначить всех сотрудников", callback_data="assign_all_employees")],
         [InlineKeyboardButton("Рассчитать календарный план", callback_data="calculate")],
-        [InlineKeyboardButton("Назад", callback_data="back_to_dependencies")]
+        [InlineKeyboardButton("Назад к зависимостям", callback_data="back_to_dependencies")],
+        [InlineKeyboardButton("Главное меню", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -108,4 +111,28 @@ def position_selection_keyboard(positions):
         keyboard.append([InlineKeyboardButton(position, callback_data=f"pos_{position_hash}")])
     
     keyboard.append([InlineKeyboardButton("Назад", callback_data="back_to_employees")])
+    return InlineKeyboardMarkup(keyboard)
+
+def back_to_main_keyboard():
+    """Создает клавиатуру с кнопкой возврата в главное меню."""
+    keyboard = [
+        [InlineKeyboardButton("Вернуться в главное меню", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def back_to_project_keyboard():
+    """Создает клавиатуру с кнопкой возврата к проекту."""
+    keyboard = [
+        [InlineKeyboardButton("Вернуться к проекту", callback_data="back_to_project")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def confirmation_keyboard(confirm_data, cancel_data):
+    """Создает клавиатуру подтверждения действия."""
+    keyboard = [
+        [
+            InlineKeyboardButton("Да", callback_data=confirm_data),
+            InlineKeyboardButton("Нет", callback_data=cancel_data)
+        ]
+    ]
     return InlineKeyboardMarkup(keyboard)

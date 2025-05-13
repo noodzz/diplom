@@ -30,6 +30,7 @@ class Project(Base):
         return f"<Project(id={self.id}, name='{self.name}')>"
 
 
+# database/models.py - упрощенная и более надежная модель
 class Task(Base):
     """Модель задачи в БД."""
     __tablename__ = 'tasks'
@@ -41,19 +42,14 @@ class Task(Base):
     position = Column(String, nullable=True)  # Может быть null для родительских задач
     required_employees = Column(Integer, default=1)
     parent_id = Column(Integer, ForeignKey('tasks.id'), nullable=True)  # ID родительской задачи
-    sequential_subtasks = Column(Boolean, default=False)  # Добавлено: флаг последовательных подзадач
 
+    # Добавим явное указание на последовательность подзадач
+    sequential_subtasks = Column(Boolean, default=False)
+
+    # Оптимизированные связи
     project = relationship("Project", back_populates="tasks")
-    predecessors = relationship(
-        "TaskDependency",
-        foreign_keys="[TaskDependency.task_id]",
-        back_populates="task"
-    )
-    subtasks = relationship("Task", backref=backref("parent", remote_side=[id]))  # Связь с подзадачами
-    parts = relationship("TaskPart", back_populates="task")  # Связь с частями задачи
-
-    def __repr__(self):
-        return f"<Task(id={self.id}, name='{self.name}', duration={self.duration})>"
+    dependencies = relationship("TaskDependency", foreign_keys="[TaskDependency.task_id]", back_populates="task")
+    subtasks = relationship("Task", backref=backref("parent", remote_side=[id]))
 
 class TaskDependency(Base):
     """Модель зависимости между задачами в БД."""
@@ -63,7 +59,7 @@ class TaskDependency(Base):
     task_id = Column(Integer, ForeignKey('tasks.id'), nullable=False)
     predecessor_id = Column(Integer, ForeignKey('tasks.id'), nullable=False)
 
-    task = relationship("Task", foreign_keys=[task_id], back_populates="predecessors")
+    task = relationship("Task", foreign_keys=[task_id], back_populates="dependencies")
     predecessor = relationship("Task", foreign_keys=[predecessor_id])
 
     def __repr__(self):

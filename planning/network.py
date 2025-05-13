@@ -2,6 +2,7 @@
 """
 Модуль для расчета параметров сетевой модели и определения критического пути
 """
+from logger import logger
 
 
 def calculate_network_parameters(project_data):
@@ -14,7 +15,16 @@ def calculate_network_parameters(project_data):
     Returns:
         Dict с рассчитанными параметрами сетевой модели
     """
-    tasks = project_data['tasks']
+    # Получаем задачи проекта
+    tasks = project_data.get('tasks', [])
+
+    if not tasks:
+        logger.warning("Нет задач для расчета сетевой модели")
+        return {
+            'network': [],
+            'critical_path': [],
+            'project_duration': 0
+        }
 
     # Создаем сетевую модель
     network = create_network_model(tasks)
@@ -30,6 +40,10 @@ def calculate_network_parameters(project_data):
 
     # Рассчитываем резервы времени для некритических работ
     calculate_reserves(network)
+
+    # Логируем результаты для отладки
+    logger.info(f"Рассчитана сетевая модель: {len(network)} задач, проект: {network[-1]['early_finish']} дней")
+    logger.info(f"Критический путь: {[task['name'] for task in critical_path]}")
 
     return {
         'network': network,
@@ -51,33 +65,70 @@ def create_network_model(tasks):
     # Создаем копию списка задач для сетевой модели
     network = []
 
+    # Ищем родительские задачи и подзадачи
+    parent_tasks = {task['id']: task for task in tasks if task.get('is_parent', False)}
+
     # Преобразуем каждую задачу в узел сетевой модели
     for task in tasks:
-        network_task = {
-            'id': task['id'],
-            'name': task['name'],
-            'duration': task['duration'],
-            'position': task['position'],
-            'predecessors': task.get('predecessors', []),
-            'required_employees': task.get('required_employees', 1),  # <--- добавьте эту строку
-            'early_start': 0,
-            'early_finish': 0,
-            'late_start': 0,
-            'late_finish': 0,
-            'is_critical': False,
-            'reserve': 0
-        }
+        # Пропускаем подзадачи - они обрабатываются в контексте родительских задач
+        if task.get('is_subtask', False):
+            continue
+
+        # Проверяем, является ли это родительской задачей с подзадачами
+        is_parent = task.get('is_parent', False) or task.get('id') in parent_tasks
+
+        # Если это родительская задача, обрабатываем ее иначе
+        if is_parent:
+            # Для родительской задачи длительность определяется её подзадачами
+            network_task = {
+                'id': task['id'],
+                'name': task['name'],
+                'duration': task['duration'],
+                'position': task.get('position', ''),
+                'predecessors': task.get('predecessors', []),
+                'required_employees': task.get('required_employees', 1),
+                'sequential_subtasks': task.get('sequential_subtasks', False),
+                'is_parent': True,
+                'early_start': 0,
+                'early_finish': 0,
+                'late_start': 0,
+                'late_finish': 0,
+                'is_critical': False,
+                'reserve': 0
+            }
+        else:
+            # Обычная задача
+            network_task = {
+                'id': task['id'],
+                'name': task['name'],
+                'duration': task['duration'],
+                'position': task.get('position', ''),
+                'predecessors': task.get('predecessors', []),
+                'required_employees': task.get('required_employees', 1),
+                'early_start': 0,
+                'early_finish': 0,
+                'late_start': 0,
+                'late_finish': 0,
+                'is_critical': False,
+                'reserve': 0
+            }
+
         network.append(network_task)
 
-    # Сортируем задачи в топологическом порядке
+    # Сортируем задачи в топологическом порядке с учетом зависимостей
     network = topological_sort(network)
+
+    # Для диагностики логируем результат
+    logger.debug(f"Создана сетевая модель: {len(network)} задач")
+    for task in network:
+        logger.debug(f"Задача: {task['name']}, предшественники: {task['predecessors']}")
 
     return network
 
 
 def topological_sort(network):
     """
-    Сортирует задачи в топологическом порядке (задачи-предшественники идут перед зависимыми задачами).
+    Сортирует задачи в топологическом порядке (с учетом зависимостей).
 
     Args:
         network: Несортированная сетевая модель
@@ -88,33 +139,60 @@ def topological_sort(network):
     # Создаем словарь id -> задача для быстрого доступа
     tasks_by_id = {task['id']: task for task in network}
 
-    # Для хранения отсортированного списка
-    sorted_tasks = []
+    # Создаем словарь id -> имя для отчетов
+    task_names = {task['id']: task['name'] for task in network}
 
-    # Множество уже обработанных задач
-    processed = set()
+    # Создаем граф зависимостей
+    graph = {}
+    for task in network:
+        task_id = task['id']
+        graph[task_id] = []
+
+    # Заполняем граф
+    for task in network:
+        task_id = task['id']
+        for pred_id in task.get('predecessors', []):
+            if pred_id in graph:
+                graph[pred_id].append(task_id)
+
+    # Нахождение порядка выполнения задач
+    visited = set()
+    temp = set()
+    order = []
 
     def visit(task_id):
-        """Рекурсивно обрабатывает задачу и ее предшественников."""
-        if task_id in processed:
-            return
+        """Обход графа в глубину с проверкой циклов"""
+        if task_id in temp:
+            # Цикл!
+            cycle_path = []
+            for t_id in list(temp) + [task_id]:
+                cycle_path.append(task_names.get(t_id, str(t_id)))
+            logger.error(f"Обнаружена циклическая зависимость: {' -> '.join(cycle_path)}")
+            raise ValueError(f"Циклическая зависимость: {' -> '.join(cycle_path)}")
 
-        task = tasks_by_id.get(task_id)
-        if not task:
-            return
-
-        # Сначала посещаем все предшествующие задачи
-        for predecessor_id in task.get('predecessors', []):
-            visit(predecessor_id)
-
-        # Добавляем текущую задачу в список
-        if task_id not in processed:
-            processed.add(task_id)
-            sorted_tasks.append(task)
+        if task_id not in visited:
+            temp.add(task_id)
+            for successor in graph.get(task_id, []):
+                visit(successor)
+            temp.remove(task_id)
+            visited.add(task_id)
+            order.insert(0, task_id)
 
     # Обходим все задачи
-    for task in network:
-        visit(task['id'])
+    for task_id in graph:
+        if task_id not in visited:
+            try:
+                visit(task_id)
+            except ValueError as e:
+                logger.error(f"Ошибка при топологической сортировке: {str(e)}")
+                # В случае ошибки возвращаем исходный порядок
+                return network
+
+    # Восстанавливаем порядок задач
+    sorted_tasks = []
+    for task_id in order:
+        if task_id in tasks_by_id:
+            sorted_tasks.append(tasks_by_id[task_id])
 
     return sorted_tasks
 
@@ -164,8 +242,11 @@ def calculate_late_times(network):
     Returns:
         Обновленная сетевая модель с поздними сроками
     """
+    if not network:
+        return network
+
     # Находим максимальный ранний срок окончания (длина всего проекта)
-    project_duration = max(task['early_finish'] for task in network) if network else 0
+    project_duration = max(task['early_finish'] for task in network)
 
     # Создаем словарь id -> задача для быстрого доступа
     tasks_by_id = {task['id']: task for task in network}
@@ -226,6 +307,9 @@ def identify_critical_path(network):
 
     # Сортируем критические задачи по раннему сроку начала
     critical_tasks.sort(key=lambda x: x['early_start'])
+
+    # Для диагностики выводим критический путь
+    logger.info(f"Критический путь: {[task['name'] for task in critical_tasks]}")
 
     return critical_tasks
 
